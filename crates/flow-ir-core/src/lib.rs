@@ -177,20 +177,17 @@ pub enum EvalError {
 /// Evaluate a `Node` against a context value, using the given dispatcher for `Step` resolution.
 ///
 /// Returns the updated context (= ctx with `Step.out` path written for each step traversed).
-pub fn eval<D: Dispatcher>(
-    node: &Node,
-    ctx: Value,
-    dispatcher: &D,
-) -> Result<Value, EvalError> {
+pub fn eval<D: Dispatcher>(node: &Node, ctx: Value, dispatcher: &D) -> Result<Value, EvalError> {
     match node {
         Node::Step { ref_, in_, out } => {
             let input = eval_expr(in_, &ctx)?;
-            let output = dispatcher
-                .dispatch(ref_, input)
-                .map_err(|e| EvalError::DispatcherError {
-                    ref_: ref_.clone(),
-                    msg: e.to_string(),
-                })?;
+            let output =
+                dispatcher
+                    .dispatch(ref_, input)
+                    .map_err(|e| EvalError::DispatcherError {
+                        ref_: ref_.clone(),
+                        msg: e.to_string(),
+                    })?;
             write_path(out, ctx, output)
         }
         Node::Seq { children } => {
@@ -266,9 +263,9 @@ pub fn eval<D: Dispatcher>(
                     for item in items_arr {
                         let branch_ctx = write_path(bind, ctx.clone(), item)?;
                         match eval(body, branch_ctx, dispatcher) {
-                            Ok(v) => records.push(
-                                serde_json::json!({"status": "fulfilled", "value": v}),
-                            ),
+                            Ok(v) => {
+                                records.push(serde_json::json!({"status": "fulfilled", "value": v}))
+                            }
                             Err(e) => records.push(
                                 serde_json::json!({"status": "rejected", "reason": e.to_string()}),
                             ),
@@ -290,15 +287,15 @@ pub fn eval<D: Dispatcher>(
             while n < *max && is_truthy(&eval_expr(cond, &cur)?) {
                 cur = eval(body, cur, dispatcher)?;
                 n += 1;
-                cur = write_path(
-                    counter,
-                    cur,
-                    Value::Number(serde_json::Number::from(n)),
-                )?;
+                cur = write_path(counter, cur, Value::Number(serde_json::Number::from(n)))?;
             }
             Ok(cur)
         }
-        Node::Try { body, catch, err_at } => match eval(body, ctx.clone(), dispatcher) {
+        Node::Try {
+            body,
+            catch,
+            err_at,
+        } => match eval(body, ctx.clone(), dispatcher) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let cur = match err_at {
@@ -358,7 +355,11 @@ pub fn read_path(path: &str, ctx: &Value) -> Result<Value, EvalError> {
 pub fn write_path(out: &Expr, ctx: Value, value: Value) -> Result<Value, EvalError> {
     let path = match out {
         Expr::Path { at } => at,
-        _ => return Err(EvalError::InvalidPath("Step.out must be a Path expr".into())),
+        _ => {
+            return Err(EvalError::InvalidPath(
+                "Step.out must be a Path expr".into(),
+            ))
+        }
     };
     let trimmed = strip_path_prefix(path)?;
     let keys: Vec<&str> = trimmed.split('.').filter(|s| !s.is_empty()).collect();

@@ -104,7 +104,9 @@ async fn eval_async_node_branch_else() {
 #[tokio::test]
 async fn eval_async_branch_non_bool_cond_errors() {
     let n = Node::Branch {
-        cond: Expr::Lit { value: json!("not bool") },
+        cond: Expr::Lit {
+            value: json!("not bool"),
+        },
         then_: Box::new(Node::Seq { children: vec![] }),
         else_: Box::new(Node::Seq { children: vec![] }),
     };
@@ -199,9 +201,7 @@ async fn eval_async_with_actual_await_in_dispatch() {
             },
             Node::Step {
                 ref_: "delay_echo".into(),
-                in_: Expr::Path {
-                    at: "$.r1".into(),
-                },
+                in_: Expr::Path { at: "$.r1".into() },
                 out: Expr::Path { at: "$.r2".into() },
             },
         ],

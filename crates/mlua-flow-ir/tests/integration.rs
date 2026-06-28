@@ -45,9 +45,7 @@ fn expr_path_root() {
 
 #[test]
 fn expr_path_reads_nested() {
-    let e = Expr::Path {
-        at: "$.a.b".into(),
-    };
+    let e = Expr::Path { at: "$.a.b".into() };
     assert_eq!(
         eval_expr(&e, &json!({ "a": { "b": "hello" } })).unwrap(),
         json!("hello")
@@ -67,7 +65,9 @@ fn expr_path_missing_returns_error() {
 
 #[test]
 fn expr_path_invalid_prefix() {
-    let e = Expr::Path { at: "no.prefix".into() };
+    let e = Expr::Path {
+        at: "no.prefix".into(),
+    };
     assert!(matches!(
         eval_expr(&e, &json!({})),
         Err(EvalError::InvalidPath(_))
@@ -178,7 +178,9 @@ fn node_branch_else_path() {
 #[test]
 fn node_branch_non_bool_cond_errors() {
     let n = Node::Branch {
-        cond: Expr::Lit { value: json!("not a bool") },
+        cond: Expr::Lit {
+            value: json!("not a bool"),
+        },
         then_: Box::new(Node::Seq { children: vec![] }),
         else_: Box::new(Node::Seq { children: vec![] }),
     };
@@ -266,8 +268,7 @@ fn serde_rejects_unknown_field_in_node() {
 
 #[test]
 fn serde_rejects_unknown_op_in_expr() {
-    let r: Result<Expr, _> =
-        serde_json::from_value(json!({ "op": "not_an_op", "value": 1 }));
+    let r: Result<Expr, _> = serde_json::from_value(json!({ "op": "not_an_op", "value": 1 }));
     assert!(r.is_err(), "unknown op should be rejected");
 }
 
@@ -277,9 +278,8 @@ fn serde_rejects_unknown_op_in_expr() {
 
 #[test]
 fn closure_dispatcher_works() {
-    let dispatcher = |_r: &str, _input: Value| -> Result<Value, EvalError> {
-        Ok(json!("closure-result"))
-    };
+    let dispatcher =
+        |_r: &str, _input: Value| -> Result<Value, EvalError> { Ok(json!("closure-result")) };
     let n = Node::Step {
         ref_: "anything".into(),
         in_: Expr::Lit { value: json!(null) },
