@@ -1,0 +1,25 @@
+[package]
+name = "mlua-flow-ir"
+version = "0.0.4"
+description = "flow.ir async runtime + mlua binding — re-exports flow-ir-core (Pure Rust sync core) and adds AsyncDispatcher + eval_async + Lua module"
+documentation = "https://docs.rs/mlua-flow-ir"
+keywords = ["flow", "ir", "mlua", "lua", "async"]
+categories = ["data-structures", "asynchronous", "api-bindings"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+flow-ir-core = { path = "../flow-ir-core", version = "0.0.1" }
+mlua = { version = "0.11", features = ["lua54", "vendored", "serde"] }
+serde_json = "1"
+async-trait = "0.1"
+async-recursion = "1"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread", "time"] }
