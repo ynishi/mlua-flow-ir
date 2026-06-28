@@ -83,21 +83,21 @@ pub trait AsyncDispatcher: Send + Sync {
 /// });
 /// ```
 #[async_recursion]
-pub async fn eval_async<D: AsyncDispatcher + ?Sized>(
-    node: &Node,
-    ctx: Value,
-    dispatcher: &D,
-) -> Result<Value, EvalError> {
+pub async fn eval_async<D>(node: &Node, ctx: Value, dispatcher: &D) -> Result<Value, EvalError>
+where
+    D: AsyncDispatcher + ?Sized,
+{
     match node {
         Node::Step { ref_, in_, out } => {
             let input = eval_expr(in_, &ctx)?;
-            let output = dispatcher
-                .dispatch(ref_, input)
-                .await
-                .map_err(|e| EvalError::DispatcherError {
-                    ref_: ref_.clone(),
-                    msg: e.to_string(),
-                })?;
+            let output =
+                dispatcher
+                    .dispatch(ref_, input)
+                    .await
+                    .map_err(|e| EvalError::DispatcherError {
+                        ref_: ref_.clone(),
+                        msg: e.to_string(),
+                    })?;
             write_path(out, ctx, output)
         }
         Node::Seq { children } => {
@@ -130,15 +130,15 @@ pub async fn eval_async<D: AsyncDispatcher + ?Sized>(
             while n < *max && is_truthy(&eval_expr(cond, &cur)?) {
                 cur = eval_async(body, cur, dispatcher).await?;
                 n += 1;
-                cur = write_path(
-                    counter,
-                    cur,
-                    Value::Number(serde_json::Number::from(n)),
-                )?;
+                cur = write_path(counter, cur, Value::Number(serde_json::Number::from(n)))?;
             }
             Ok(cur)
         }
-        Node::Try { body, catch, err_at } => match eval_async(body, ctx.clone(), dispatcher).await {
+        Node::Try {
+            body,
+            catch,
+            err_at,
+        } => match eval_async(body, ctx.clone(), dispatcher).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 let cur = match err_at {
@@ -154,7 +154,7 @@ pub async fn eval_async<D: AsyncDispatcher + ?Sized>(
 /// Fanout 並列 evaluator。 executor 不問 (futures crate のみ)、 caller の async
 /// runtime (tokio / async-std / 自前) がそのまま並列性を出す。
 #[async_recursion]
-async fn fanout_eval<D: AsyncDispatcher + ?Sized>(
+async fn fanout_eval<D>(
     items: &Expr,
     bind: &Expr,
     body: &Node,
@@ -162,7 +162,10 @@ async fn fanout_eval<D: AsyncDispatcher + ?Sized>(
     out: &Expr,
     ctx: Value,
     dispatcher: &D,
-) -> Result<Value, EvalError> {
+) -> Result<Value, EvalError>
+where
+    D: AsyncDispatcher + ?Sized,
+{
     use futures::future::{join_all, select_ok, FutureExt};
 
     let items_val = eval_expr(items, &ctx)?;
@@ -260,20 +263,19 @@ impl<'a> Dispatcher for LuaDispatcher<'a> {
                 ref_: ref_.into(),
                 msg: format!("to_value: {}", e),
             })?;
-        let result: mlua::Value = self
-            .func
-            .call((ref_.to_string(), lua_input))
-            .map_err(|e| EvalError::DispatcherError {
+        let result: mlua::Value = self.func.call((ref_.to_string(), lua_input)).map_err(|e| {
+            EvalError::DispatcherError {
                 ref_: ref_.into(),
                 msg: format!("lua call: {}", e),
+            }
+        })?;
+        let value: Value = self
+            .lua
+            .from_value(result)
+            .map_err(|e| EvalError::DispatcherError {
+                ref_: ref_.into(),
+                msg: format!("from_value: {}", e),
             })?;
-        let value: Value =
-            self.lua
-                .from_value(result)
-                .map_err(|e| EvalError::DispatcherError {
-                    ref_: ref_.into(),
-                    msg: format!("from_value: {}", e),
-                })?;
         Ok(value)
     }
 }
