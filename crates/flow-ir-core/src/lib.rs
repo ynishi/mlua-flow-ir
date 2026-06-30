@@ -102,10 +102,7 @@ pub enum Node {
     /// 結果を `at` (Path Expr) に write する。 dispatcher 不要、 副作用は
     /// `CtxStorage.write` 1 回のみ。 `Seq` の中で Step 間の Adhoc update 表現に
     /// 使う (= IR primitive、 Command 履歴は CtxStorage の write hook 経由で取得)。
-    Assign {
-        at: Expr,
-        value: Expr,
-    },
+    Assign { at: Expr, value: Expr },
 }
 
 /// Fanout join semantics (Promise / futures combinators).
@@ -129,7 +126,14 @@ pub enum JoinMode {
 /// flow.ir Expr op.
 ///
 /// Discriminated with `op` tag, `deny_unknown_fields`, `rename_all = "snake_case"`.
-/// MVP scope: Path / Lit / Eq only.
+///
+/// Ops:
+/// - read / literal: `Path` / `Lit`
+/// - comparison: `Eq` / `Ne` / `Lt` / `Le` / `Gt` / `Ge`
+/// - boolean: `Not` / `And` / `Or`
+/// - existence: `Exists` (Path lookup that returns bool instead of erroring)
+/// - arithmetic: `Add` / `Sub` / `Mul` / `Div`
+/// - aggregate: `Len` (length of array / string / object) / `In` (membership in array)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", deny_unknown_fields, rename_all = "snake_case")]
 pub enum Expr {
@@ -139,6 +143,43 @@ pub enum Expr {
     Lit { value: Value },
     /// `Eq` — boolean equality of two sub-expressions.
     Eq { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Ne` — boolean inequality.
+    Ne { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Lt` — numeric `lhs < rhs` (both sides coerced to f64).
+    Lt { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Le` — numeric `lhs <= rhs`.
+    Le { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Gt` — numeric `lhs > rhs`.
+    Gt { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Ge` — numeric `lhs >= rhs`.
+    Ge { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Not` — boolean negation of `operand` (truthy-based; null/false → true).
+    Not { operand: Box<Expr> },
+    /// `And` — variadic boolean conjunction (short-circuit). Empty list → true.
+    And { operands: Vec<Expr> },
+    /// `Or` — variadic boolean disjunction (short-circuit). Empty list → false.
+    Or { operands: Vec<Expr> },
+    /// `Exists` — read a path; return `true` if it resolves, `false` if missing.
+    /// Distinct from `Path` (which raises `PathNotFound`) and from `IsNull`
+    /// (a present-but-null value resolves to `true` here).
+    Exists { at: String },
+    /// `Add` — numeric `lhs + rhs` (f64).
+    Add { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Sub` — numeric `lhs - rhs`.
+    Sub { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Mul` — numeric `lhs * rhs`.
+    Mul { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Div` — numeric `lhs / rhs`. Division by zero raises `DispatcherError`.
+    Div { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Len` — length of `of`: array → element count, string → char count,
+    /// object → key count. Other types raise `DispatcherError`.
+    Len { of: Box<Expr> },
+    /// `In` — `true` if `needle` equals any element of `haystack` (which must
+    /// evaluate to an array).
+    In {
+        needle: Box<Expr>,
+        haystack: Box<Expr>,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -232,7 +273,13 @@ impl CtxStorage for MemoryCtx {
     fn write(&self, path: &str, value: Value) -> Result<(), EvalError> {
         let mut guard = self.inner.lock().expect("ctx mutex poisoned");
         let cur = std::mem::take(&mut *guard);
-        let updated = write_path(&Expr::Path { at: path.to_string() }, cur, value)?;
+        let updated = write_path(
+            &Expr::Path {
+                at: path.to_string(),
+            },
+            cur,
+            value,
+        )?;
         *guard = updated;
         Ok(())
     }
@@ -429,11 +476,11 @@ fn fanout_eval_sync<D: Dispatcher>(
                 let branch_ctx = write_path(bind, base_snap.clone(), item)?;
                 let storage = MemoryCtx::new(branch_ctx);
                 match eval_with_storage(body, &storage, dispatcher) {
-                    Ok(()) => records
-                        .push(serde_json::json!({"status": "fulfilled", "value": storage.snapshot()})),
-                    Err(e) => records.push(
-                        serde_json::json!({"status": "rejected", "reason": e.to_string()}),
+                    Ok(()) => records.push(
+                        serde_json::json!({"status": "fulfilled", "value": storage.snapshot()}),
                     ),
+                    Err(e) => records
+                        .push(serde_json::json!({"status": "rejected", "reason": e.to_string()})),
                 }
             }
             Ok(Value::Array(records))
@@ -471,12 +518,111 @@ pub fn eval_expr(expr: &Expr, ctx: &Value) -> Result<Value, EvalError> {
     match expr {
         Expr::Lit { value } => Ok(value.clone()),
         Expr::Path { at } => read_path(at, ctx),
-        Expr::Eq { lhs, rhs } => {
-            let lv = eval_expr(lhs, ctx)?;
-            let rv = eval_expr(rhs, ctx)?;
-            Ok(Value::Bool(lv == rv))
+        Expr::Eq { lhs, rhs } => Ok(Value::Bool(eval_expr(lhs, ctx)? == eval_expr(rhs, ctx)?)),
+        Expr::Ne { lhs, rhs } => Ok(Value::Bool(eval_expr(lhs, ctx)? != eval_expr(rhs, ctx)?)),
+        Expr::Lt { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a < b),
+        Expr::Le { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a <= b),
+        Expr::Gt { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a > b),
+        Expr::Ge { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a >= b),
+        Expr::Not { operand } => Ok(Value::Bool(!is_truthy(&eval_expr(operand, ctx)?))),
+        Expr::And { operands } => {
+            for op in operands {
+                if !is_truthy(&eval_expr(op, ctx)?) {
+                    return Ok(Value::Bool(false));
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        Expr::Or { operands } => {
+            for op in operands {
+                if is_truthy(&eval_expr(op, ctx)?) {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            Ok(Value::Bool(false))
+        }
+        Expr::Exists { at } => Ok(Value::Bool(read_path(at, ctx).is_ok())),
+        Expr::Add { lhs, rhs } => num_arith(lhs, rhs, ctx, "add", |a, b| Some(a + b)),
+        Expr::Sub { lhs, rhs } => num_arith(lhs, rhs, ctx, "sub", |a, b| Some(a - b)),
+        Expr::Mul { lhs, rhs } => num_arith(lhs, rhs, ctx, "mul", |a, b| Some(a * b)),
+        Expr::Div { lhs, rhs } => num_arith(lhs, rhs, ctx, "div", |a, b| {
+            if b == 0.0 {
+                None
+            } else {
+                Some(a / b)
+            }
+        }),
+        Expr::Len { of } => {
+            let v = eval_expr(of, ctx)?;
+            let n = match &v {
+                Value::Array(a) => a.len(),
+                Value::String(s) => s.chars().count(),
+                Value::Object(o) => o.len(),
+                other => {
+                    return Err(EvalError::DispatcherError {
+                        ref_: "expr.len".into(),
+                        msg: format!("len: unsupported type {other:?}"),
+                    })
+                }
+            };
+            Ok(Value::Number(serde_json::Number::from(n as u64)))
+        }
+        Expr::In { needle, haystack } => {
+            let n = eval_expr(needle, ctx)?;
+            let h = eval_expr(haystack, ctx)?;
+            match h {
+                Value::Array(a) => Ok(Value::Bool(a.iter().any(|e| e == &n))),
+                other => Err(EvalError::DispatcherError {
+                    ref_: "expr.in".into(),
+                    msg: format!("in: haystack must be array, got {other:?}"),
+                }),
+            }
         }
     }
+}
+
+/// Coerce a JSON value to f64 for numeric ops. Bool / null / non-number raise.
+fn to_f64(v: &Value, op: &str) -> Result<f64, EvalError> {
+    match v {
+        Value::Number(n) => n.as_f64().ok_or_else(|| EvalError::DispatcherError {
+            ref_: format!("expr.{op}"),
+            msg: format!("non-f64-representable number: {n}"),
+        }),
+        other => Err(EvalError::DispatcherError {
+            ref_: format!("expr.{op}"),
+            msg: format!("expected number, got {other:?}"),
+        }),
+    }
+}
+
+fn num_cmp<F>(lhs: &Expr, rhs: &Expr, ctx: &Value, cmp: F) -> Result<Value, EvalError>
+where
+    F: Fn(f64, f64) -> bool,
+{
+    let lv = eval_expr(lhs, ctx)?;
+    let rv = eval_expr(rhs, ctx)?;
+    let l = to_f64(&lv, "cmp")?;
+    let r = to_f64(&rv, "cmp")?;
+    Ok(Value::Bool(cmp(l, r)))
+}
+
+fn num_arith<F>(lhs: &Expr, rhs: &Expr, ctx: &Value, op: &str, f: F) -> Result<Value, EvalError>
+where
+    F: Fn(f64, f64) -> Option<f64>,
+{
+    let lv = eval_expr(lhs, ctx)?;
+    let rv = eval_expr(rhs, ctx)?;
+    let l = to_f64(&lv, op)?;
+    let r = to_f64(&rv, op)?;
+    let result = f(l, r).ok_or_else(|| EvalError::DispatcherError {
+        ref_: format!("expr.{op}"),
+        msg: "arithmetic failure (e.g. division by zero)".into(),
+    })?;
+    let n = serde_json::Number::from_f64(result).ok_or_else(|| EvalError::DispatcherError {
+        ref_: format!("expr.{op}"),
+        msg: format!("result not f64-representable: {result}"),
+    })?;
+    Ok(Value::Number(n))
 }
 
 // ──────────────────────────────────────────────────────────────────────────

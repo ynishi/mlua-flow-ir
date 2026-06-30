@@ -93,7 +93,9 @@ async fn external_task_injects_state_during_step_await() {
         children: vec![
             Node::Step {
                 ref_: "wait_for_signal".into(),
-                in_: Expr::Path { at: "$.seed".into() },
+                in_: Expr::Path {
+                    at: "$.seed".into(),
+                },
                 out: Expr::Path {
                     at: "$.signal_received".into(),
                 },
@@ -156,8 +158,7 @@ async fn external_task_injects_state_during_step_await() {
 async fn external_task_constructs_expr_at_runtime_and_writes() {
     use mlua_flow_ir::eval_expr;
 
-    let storage: Arc<dyn CtxStorage> =
-        MemoryCtx::shared(json!({ "base": 100, "multiplier": 3 }));
+    let storage: Arc<dyn CtxStorage> = MemoryCtx::shared(json!({ "base": 100, "multiplier": 3 }));
 
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let (release_tx, release_rx) = oneshot::channel::<()>();
@@ -168,8 +169,12 @@ async fn external_task_constructs_expr_at_runtime_and_writes() {
 
     let flow = Node::Step {
         ref_: "wait_for_signal".into(),
-        in_: Expr::Path { at: "$.base".into() },
-        out: Expr::Path { at: "$.done".into() },
+        in_: Expr::Path {
+            at: "$.base".into(),
+        },
+        out: Expr::Path {
+            at: "$.done".into(),
+        },
     };
 
     let storage_for_external = storage.clone();
