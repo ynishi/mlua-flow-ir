@@ -23,10 +23,12 @@
 // ──────────────────────────────────────────────────────────────────────────
 
 pub use flow_ir_core::{
-    eval, eval_expr, is_truthy, read_path, write_path, Dispatcher, EvalError, Expr, JoinMode, Node,
+    eval, eval_expr, eval_with_storage, is_truthy, read_path, write_path, CtxStorage, Dispatcher,
+    EvalError, Expr, JoinMode, MemoryCtx, Node,
 };
 
 use serde_json::Value;
+use std::sync::Arc;
 
 // ══════════════════════════════════════════════════════════════════════════
 // v0.0.2 — Async core (eval_async + AsyncDispatcher trait)
@@ -82,14 +84,28 @@ pub trait AsyncDispatcher: Send + Sync {
 ///     assert_eq!(out, json!({ "input": "hello", "output": "HELLO" }));
 /// });
 /// ```
+/// Storage-backed async evaluator — canonical entry.
+///
+/// `Arc<dyn CtxStorage>` 経由で ctx を共有することで、 dispatch().await suspend
+/// 中に外部 task が同じ ctx に `write` できる (= dynamic State injection 経路)。
+/// Step 評価の境界で `ctx.snapshot()` を取って Expr eval に渡す。
 #[async_recursion]
-pub async fn eval_async<D>(node: &Node, ctx: Value, dispatcher: &D) -> Result<Value, EvalError>
+pub async fn eval_async_with_storage<D>(
+    node: &Node,
+    ctx: Arc<dyn CtxStorage>,
+    dispatcher: &D,
+) -> Result<(), EvalError>
 where
     D: AsyncDispatcher + ?Sized,
 {
     match node {
         Node::Step { ref_, in_, out } => {
-            let input = eval_expr(in_, &ctx)?;
+            // snap は dispatch() **呼出し前** の view。 dispatch().await 中に
+            // 外部 task が ctx.write しても、 ここで取った snap は影響を受けず
+            // input の値は確定。 write_target の `out` path への write は
+            // dispatch 完了後に共有 ctx を直接更新。
+            let snap = ctx.snapshot();
+            let input = eval_expr(in_, &snap)?;
             let output =
                 dispatcher
                     .dispatch(ref_, input)
@@ -98,20 +114,22 @@ where
                         ref_: ref_.clone(),
                         msg: e.to_string(),
                     })?;
-            write_path(out, ctx, output)
+            ctx.write(path_str_async(out)?, output)
         }
         Node::Seq { children } => {
-            let mut cur = ctx;
             for child in children {
-                cur = eval_async(child, cur, dispatcher).await?;
+                eval_async_with_storage(child, ctx.clone(), dispatcher).await?;
             }
-            Ok(cur)
+            Ok(())
         }
-        Node::Branch { cond, then_, else_ } => match eval_expr(cond, &ctx)? {
-            Value::Bool(true) => eval_async(then_, ctx, dispatcher).await,
-            Value::Bool(false) => eval_async(else_, ctx, dispatcher).await,
-            other => Err(EvalError::NonBoolCond(other)),
-        },
+        Node::Branch { cond, then_, else_ } => {
+            let snap = ctx.snapshot();
+            match eval_expr(cond, &snap)? {
+                Value::Bool(true) => eval_async_with_storage(then_, ctx, dispatcher).await,
+                Value::Bool(false) => eval_async_with_storage(else_, ctx, dispatcher).await,
+                other => Err(EvalError::NonBoolCond(other)),
+            }
+        }
         Node::Fanout {
             items,
             bind,
@@ -125,34 +143,73 @@ where
             body,
             max,
         } => {
-            let mut cur = write_path(counter, ctx, Value::Number(serde_json::Number::from(0u32)))?;
+            let counter_path = path_str_async(counter)?.to_string();
+            ctx.write(&counter_path, Value::Number(serde_json::Number::from(0u32)))?;
             let mut n: u32 = 0;
-            while n < *max && is_truthy(&eval_expr(cond, &cur)?) {
-                cur = eval_async(body, cur, dispatcher).await?;
+            loop {
+                if n >= *max {
+                    break;
+                }
+                let snap = ctx.snapshot();
+                if !is_truthy(&eval_expr(cond, &snap)?) {
+                    break;
+                }
+                eval_async_with_storage(body, ctx.clone(), dispatcher).await?;
                 n += 1;
-                cur = write_path(counter, cur, Value::Number(serde_json::Number::from(n)))?;
+                ctx.write(&counter_path, Value::Number(serde_json::Number::from(n)))?;
             }
-            Ok(cur)
+            Ok(())
         }
         Node::Try {
             body,
             catch,
             err_at,
-        } => match eval_async(body, ctx.clone(), dispatcher).await {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                let cur = match err_at {
-                    Some(at) => write_path(at, ctx, Value::String(e.to_string()))?,
-                    None => ctx,
-                };
-                eval_async(catch, cur, dispatcher).await
+        } => {
+            let snap_before = ctx.snapshot();
+            match eval_async_with_storage(body, ctx.clone(), dispatcher).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    ctx.replace(snap_before);
+                    if let Some(at) = err_at {
+                        ctx.write(path_str_async(at)?, Value::String(e.to_string()))?;
+                    }
+                    eval_async_with_storage(catch, ctx, dispatcher).await
+                }
             }
-        },
+        }
+        Node::Assign { at, value } => {
+            let snap = ctx.snapshot();
+            let v = eval_expr(value, &snap)?;
+            ctx.write(path_str_async(at)?, v)
+        }
     }
 }
 
-/// Fanout 並列 evaluator。 executor 不問 (futures crate のみ)、 caller の async
-/// runtime (tokio / async-std / 自前) がそのまま並列性を出す。
+/// Legacy Value-passing async evaluator — backward compat wrapper around
+/// `eval_async_with_storage` + `MemoryCtx`. 既存 caller (= dynamic injection
+/// を要求しない用途) は引き続きこの API で OK。
+pub async fn eval_async<D>(node: &Node, ctx: Value, dispatcher: &D) -> Result<Value, EvalError>
+where
+    D: AsyncDispatcher + ?Sized,
+{
+    let storage: Arc<dyn CtxStorage> = MemoryCtx::shared(ctx);
+    eval_async_with_storage(node, storage.clone(), dispatcher).await?;
+    Ok(storage.snapshot())
+}
+
+/// Resolve `Path` Expr to its literal `$.a.b.c` string (async eval 側 helper).
+fn path_str_async(expr: &Expr) -> Result<&str, EvalError> {
+    match expr {
+        Expr::Path { at } => Ok(at.as_str()),
+        _ => Err(EvalError::InvalidPath(
+            "expected Path expr for write target".into(),
+        )),
+    }
+}
+
+/// Fanout 並列 evaluator (storage-backed)。 各 branch は disjoint MemoryCtx
+/// を持ち、 branch 内で write しても共有 ctx には影響しない (= snapshot 切り出し
+/// semantic)。 集約結果は最後に共有 ctx の `out` path に write。
 #[async_recursion]
 async fn fanout_eval<D>(
     items: &Expr,
@@ -160,15 +217,16 @@ async fn fanout_eval<D>(
     body: &Node,
     join: JoinMode,
     out: &Expr,
-    ctx: Value,
+    ctx: Arc<dyn CtxStorage>,
     dispatcher: &D,
-) -> Result<Value, EvalError>
+) -> Result<(), EvalError>
 where
     D: AsyncDispatcher + ?Sized,
 {
     use futures::future::{join_all, select_ok, FutureExt};
 
-    let items_val = eval_expr(items, &ctx)?;
+    let snap = ctx.snapshot();
+    let items_val = eval_expr(items, &snap)?;
     let items_arr = match items_val {
         Value::Array(a) => a,
         other => {
@@ -179,55 +237,62 @@ where
         }
     };
 
-    // 各 branch を Pin<Box<dyn Future>> として並列化、 ctx は caller の snapshot を
-    // clone して各 branch に渡す (= disjoint state)。
-    let branch_futs: Vec<_> = items_arr
+    // branch storage を pre-allocate して、 各 branch future と pair で持つ。
+    // 集約時に同じ storage の snapshot を取って結果にする。
+    let branches: Vec<Arc<dyn CtxStorage>> = items_arr
         .into_iter()
-        .map(|item| {
-            let branch_ctx = write_path(bind, ctx.clone(), item)?;
-            Ok::<_, EvalError>(eval_async(body, branch_ctx, dispatcher))
+        .map(|item| -> Result<Arc<dyn CtxStorage>, EvalError> {
+            let branch_ctx = write_path(bind, snap.clone(), item)?;
+            Ok(MemoryCtx::shared(branch_ctx))
         })
         .collect::<Result<_, _>>()?;
 
+    // 各 branch を `(idx, future)` で wrap。 future は branch storage と body を
+    // 共有して走る。
+    let branch_futs: Vec<_> = branches
+        .iter()
+        .map(|b| eval_async_with_storage(body, b.clone(), dispatcher))
+        .collect();
+
     let joined: Value = match join {
         JoinMode::All => {
-            // try_join_all = 全成功で Vec、 1 つでも fail で即 abort + error
-            let results = futures::future::try_join_all(branch_futs).await?;
-            Value::Array(results)
+            futures::future::try_join_all(branch_futs).await?;
+            Value::Array(branches.iter().map(|b| b.snapshot()).collect())
         }
         JoinMode::Any => {
             if branch_futs.is_empty() {
                 Value::Array(vec![])
             } else {
-                // select_ok = 最初に成功した branch の ctx を winner、 全 fail で last error
-                let mapped = branch_futs
+                let mapped: Vec<_> = branch_futs
                     .into_iter()
-                    .map(|f| f.boxed())
-                    .collect::<Vec<_>>();
-                let (winner, _rest) = select_ok(mapped).await?;
-                winner
+                    .enumerate()
+                    .map(|(i, f)| f.map(move |r| r.map(|()| i)).boxed())
+                    .collect();
+                let (winner_idx, _rest) = select_ok(mapped).await?;
+                branches[winner_idx].snapshot()
             }
         }
         JoinMode::Race => {
             if branch_futs.is_empty() {
                 Value::Array(vec![])
             } else {
-                // select = 最初に settle した branch (Ok / Err 問わず) の結果
-                let mapped = branch_futs
+                let mapped: Vec<_> = branch_futs
                     .into_iter()
-                    .map(|f| f.boxed())
-                    .collect::<Vec<_>>();
+                    .enumerate()
+                    .map(|(i, f)| f.map(move |r| r.map(|()| i)).boxed())
+                    .collect();
                 let (first, _idx, _rest) = futures::future::select_all(mapped).await;
-                first?
+                let winner_idx = first?;
+                branches[winner_idx].snapshot()
             }
         }
         JoinMode::AllSettled => {
-            // 全 branch 完走、 fail も rejected record として残す
             let results = join_all(branch_futs).await;
             let records: Vec<Value> = results
                 .into_iter()
-                .map(|r| match r {
-                    Ok(v) => serde_json::json!({"status": "fulfilled", "value": v}),
+                .zip(branches.iter())
+                .map(|(r, b)| match r {
+                    Ok(()) => serde_json::json!({"status": "fulfilled", "value": b.snapshot()}),
                     Err(e) => serde_json::json!({"status": "rejected", "reason": e.to_string()}),
                 })
                 .collect();
@@ -235,7 +300,7 @@ where
         }
     };
 
-    write_path(out, ctx, joined)
+    ctx.write(path_str_async(out)?, joined)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
