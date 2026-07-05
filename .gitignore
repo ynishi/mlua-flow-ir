@@ -3,3 +3,7 @@
 /workspace
 /.claude
 /.sandbox-snapshots
+workspace
+.worktrees
+.claude
+.mcp.json
