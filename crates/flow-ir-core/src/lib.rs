@@ -1,8 +1,10 @@
 #![deny(unsafe_code)]
 //! flow.ir Pure Rust schema + sync interpreter.
 //!
-//! 3 Node kinds (Step / Seq / Branch) + Fanout / Loop / Try + 3 Expr ops
-//! (Path / Lit / Eq) + sync `eval` + `Dispatcher` trait + Path read/write.
+//! Node kinds (Step / Seq / Branch / Fanout / Loop / Try / Assign) + Expr ops
+//! (canonical wire format — comparison / boolean / existence / arithmetic /
+//! aggregate / `call_extern`) + sync `eval` + `Dispatcher` trait + `Externs`
+//! registry + Path read/write.
 //!
 //! mlua / futures / async 依存ゼロ。 async runtime + mlua binding は上流
 //! `mlua-flow-ir` crate が担当する 4 層 stack の core 層。
@@ -126,14 +128,18 @@ pub enum JoinMode {
 /// flow.ir Expr op.
 ///
 /// Discriminated with `op` tag, `deny_unknown_fields`, `rename_all = "snake_case"`.
+/// Wire format (op tag / field names) follows the canonical `flow-ir-lua`
+/// schema (`flow/ir/schema.lua`) verbatim: `gte`/`lte` (not `ge`/`le`),
+/// `args` on `and`/`or`, `arg` on `not`/`len`/`exists`.
 ///
 /// Ops:
 /// - read / literal: `Path` / `Lit`
-/// - comparison: `Eq` / `Ne` / `Lt` / `Le` / `Gt` / `Ge`
+/// - comparison: `Eq` / `Ne` / `Lt` / `Lte` / `Gt` / `Gte` (numbers or strings)
 /// - boolean: `Not` / `And` / `Or`
-/// - existence: `Exists` (Path lookup that returns bool instead of erroring)
-/// - arithmetic: `Add` / `Sub` / `Mul` / `Div`
+/// - existence: `Exists` (truthy iff `arg` evaluates to a non-null value)
+/// - arithmetic: `Add` / `Sub` / `Mul` / `Div` / `Mod`
 /// - aggregate: `Len` (length of array / string / object) / `In` (membership in array)
+/// - hatch: `CallExtern` (host-registered pure function, resolved via `Externs`)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", deny_unknown_fields, rename_all = "snake_case")]
 pub enum Expr {
@@ -145,24 +151,25 @@ pub enum Expr {
     Eq { lhs: Box<Expr>, rhs: Box<Expr> },
     /// `Ne` — boolean inequality.
     Ne { lhs: Box<Expr>, rhs: Box<Expr> },
-    /// `Lt` — numeric `lhs < rhs` (both sides coerced to f64).
+    /// `Lt` — `lhs < rhs`. Both numbers (f64) or both strings (lexicographic),
+    /// mirroring canonical Lua `<` semantics. Mixed / other types raise.
     Lt { lhs: Box<Expr>, rhs: Box<Expr> },
-    /// `Le` — numeric `lhs <= rhs`.
-    Le { lhs: Box<Expr>, rhs: Box<Expr> },
-    /// `Gt` — numeric `lhs > rhs`.
+    /// `Lte` — `lhs <= rhs` (canonical wire tag `lte`).
+    Lte { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Gt` — `lhs > rhs`.
     Gt { lhs: Box<Expr>, rhs: Box<Expr> },
-    /// `Ge` — numeric `lhs >= rhs`.
-    Ge { lhs: Box<Expr>, rhs: Box<Expr> },
-    /// `Not` — boolean negation of `operand` (truthy-based; null/false → true).
-    Not { operand: Box<Expr> },
+    /// `Gte` — `lhs >= rhs` (canonical wire tag `gte`).
+    Gte { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Not` — boolean negation of `arg` (truthy-based; null/false → true).
+    Not { arg: Box<Expr> },
     /// `And` — variadic boolean conjunction (short-circuit). Empty list → true.
-    And { operands: Vec<Expr> },
+    And { args: Vec<Expr> },
     /// `Or` — variadic boolean disjunction (short-circuit). Empty list → false.
-    Or { operands: Vec<Expr> },
-    /// `Exists` — read a path; return `true` if it resolves, `false` if missing.
-    /// Distinct from `Path` (which raises `PathNotFound`) and from `IsNull`
-    /// (a present-but-null value resolves to `true` here).
-    Exists { at: String },
+    Or { args: Vec<Expr> },
+    /// `Exists` — evaluate `arg`; `true` iff it resolves to a non-null value.
+    /// A `Path` arg that raises `PathNotFound` yields `false` (canonical
+    /// `arg ~= nil` semantics — JSON null maps to Lua nil).
+    Exists { arg: Box<Expr> },
     /// `Add` — numeric `lhs + rhs` (f64).
     Add { lhs: Box<Expr>, rhs: Box<Expr> },
     /// `Sub` — numeric `lhs - rhs`.
@@ -171,14 +178,26 @@ pub enum Expr {
     Mul { lhs: Box<Expr>, rhs: Box<Expr> },
     /// `Div` — numeric `lhs / rhs`. Division by zero raises `DispatcherError`.
     Div { lhs: Box<Expr>, rhs: Box<Expr> },
-    /// `Len` — length of `of`: array → element count, string → char count,
+    /// `Mod` — numeric `lhs % rhs` (Lua `%` semantics: result takes the sign
+    /// of `rhs`). Modulo by zero raises `DispatcherError`.
+    Mod { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `Len` — length of `arg`: array → element count, string → char count,
     /// object → key count. Other types raise `DispatcherError`.
-    Len { of: Box<Expr> },
+    Len { arg: Box<Expr> },
     /// `In` — `true` if `needle` equals any element of `haystack` (which must
-    /// evaluate to an array).
+    /// evaluate to an array). Rust-side extension (not in canonical schema).
     In {
         needle: Box<Expr>,
         haystack: Box<Expr>,
+    },
+    /// `CallExtern` — value-shape Hatch: resolve a host-injected pure function
+    /// by opaque key via the `Externs` registry, apply it to evaluated args,
+    /// return the value. The registered function MUST be pure (no side
+    /// effects, no flow control) — see canonical `doc/ir.md §call_extern`.
+    CallExtern {
+        #[serde(rename = "ref")]
+        ref_: String,
+        args: Vec<Expr>,
     },
 }
 
@@ -217,6 +236,100 @@ pub enum EvalError {
     NonBoolCond(Value),
     #[error("dispatcher error for ref '{ref_}': {msg}")]
     DispatcherError { ref_: String, msg: String },
+    #[error("extern error for ref '{ref_}': {msg}")]
+    ExternError { ref_: String, msg: String },
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Externs — whitelist registry for `call_extern` Expr (canonical opts.externs)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Extern registry: resolves a `call_extern.ref` against evaluated args and
+/// returns the value. Mirror of canonical `opts.externs` (flow-ir-lua
+/// `interpreter.lua`): each entry MUST be a pure function — no side effects,
+/// no flow control, value-shape manipulation only.
+///
+/// Same DI pattern as [`Dispatcher`]: host crates provide concrete
+/// implementations ([`ExternMap`] for plain Rust closures, mlua bridge for
+/// Lua functions upstream).
+pub trait Externs {
+    /// Invoke the extern registered under `ref_` with already-evaluated args.
+    /// Unregistered refs raise [`EvalError::ExternError`].
+    fn call(&self, ref_: &str, args: &[Value]) -> Result<Value, EvalError>;
+}
+
+/// Empty registry — every `call_extern` raises `ExternError` (parity with
+/// canonical "requires opts.externs" error). Used by the externs-less
+/// compat wrappers (`eval` / `eval_expr` / `eval_with_storage`).
+pub struct NoExterns;
+
+impl Externs for NoExterns {
+    fn call(&self, ref_: &str, _args: &[Value]) -> Result<Value, EvalError> {
+        Err(EvalError::ExternError {
+            ref_: ref_.into(),
+            msg: "no externs registry configured".into(),
+        })
+    }
+}
+
+/// Boxed pure extern function stored in [`ExternMap`].
+pub type ExternFn = Box<dyn Fn(&[Value]) -> Result<Value, EvalError> + Send + Sync>;
+
+/// `HashMap`-backed [`Externs`] impl for host-side Rust closures.
+///
+/// ```
+/// use flow_ir_core::{eval_expr_with_externs, EvalError, Expr, ExternMap};
+/// use serde_json::{json, Value};
+///
+/// let mut externs = ExternMap::new();
+/// externs.register("math.sqrt", |args: &[Value]| {
+///     let x = args[0].as_f64().ok_or_else(|| EvalError::ExternError {
+///         ref_: "math.sqrt".into(),
+///         msg: "expected number".into(),
+///     })?;
+///     Ok(json!(x.sqrt()))
+/// });
+///
+/// let expr: Expr = serde_json::from_value(json!({
+///     "op": "call_extern", "ref": "math.sqrt",
+///     "args": [{ "op": "lit", "value": 9.0 }],
+/// })).unwrap();
+/// let out = eval_expr_with_externs(&expr, &json!({}), &externs).unwrap();
+/// assert_eq!(out, json!(3.0));
+/// ```
+#[derive(Default)]
+pub struct ExternMap {
+    fns: std::collections::HashMap<String, ExternFn>,
+}
+
+impl ExternMap {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a pure function under `name` (overwrites an existing entry).
+    pub fn register<F>(&mut self, name: impl Into<String>, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Value, EvalError> + Send + Sync + 'static,
+    {
+        self.fns.insert(name.into(), Box::new(f));
+    }
+
+    /// Whether `name` is registered (compile-time whitelist check parity).
+    pub fn contains(&self, name: &str) -> bool {
+        self.fns.contains_key(name)
+    }
+}
+
+impl Externs for ExternMap {
+    fn call(&self, ref_: &str, args: &[Value]) -> Result<Value, EvalError> {
+        let f = self.fns.get(ref_).ok_or_else(|| EvalError::ExternError {
+            ref_: ref_.into(),
+            msg: "not registered in externs".into(),
+        })?;
+        f(args)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -320,10 +433,20 @@ pub fn eval_with_storage<D: Dispatcher>(
     ctx: &dyn CtxStorage,
     dispatcher: &D,
 ) -> Result<(), EvalError> {
+    eval_with_storage_externs(node, ctx, dispatcher, &NoExterns)
+}
+
+/// `eval_with_storage` + externs registry for `call_extern` Expr resolution.
+pub fn eval_with_storage_externs<D: Dispatcher>(
+    node: &Node,
+    ctx: &dyn CtxStorage,
+    dispatcher: &D,
+    externs: &dyn Externs,
+) -> Result<(), EvalError> {
     match node {
         Node::Step { ref_, in_, out } => {
             let snap = ctx.snapshot();
-            let input = eval_expr(in_, &snap)?;
+            let input = eval_expr_with_externs(in_, &snap, externs)?;
             let output =
                 dispatcher
                     .dispatch(ref_, input)
@@ -335,15 +458,15 @@ pub fn eval_with_storage<D: Dispatcher>(
         }
         Node::Seq { children } => {
             for child in children {
-                eval_with_storage(child, ctx, dispatcher)?;
+                eval_with_storage_externs(child, ctx, dispatcher, externs)?;
             }
             Ok(())
         }
         Node::Branch { cond, then_, else_ } => {
             let snap = ctx.snapshot();
-            match eval_expr(cond, &snap)? {
-                Value::Bool(true) => eval_with_storage(then_, ctx, dispatcher),
-                Value::Bool(false) => eval_with_storage(else_, ctx, dispatcher),
+            match eval_expr_with_externs(cond, &snap, externs)? {
+                Value::Bool(true) => eval_with_storage_externs(then_, ctx, dispatcher, externs),
+                Value::Bool(false) => eval_with_storage_externs(else_, ctx, dispatcher, externs),
                 other => Err(EvalError::NonBoolCond(other)),
             }
         }
@@ -357,7 +480,7 @@ pub fn eval_with_storage<D: Dispatcher>(
             // Fanout fork = 各 branch を disjoint MemoryCtx に切り出して逐次
             // (sync) evaluate、 集約結果を共有 ctx の `out` path に書く。
             let snap = ctx.snapshot();
-            let items_val = eval_expr(items, &snap)?;
+            let items_val = eval_expr_with_externs(items, &snap, externs)?;
             let items_arr = match items_val {
                 Value::Array(a) => a,
                 other => {
@@ -367,7 +490,8 @@ pub fn eval_with_storage<D: Dispatcher>(
                     })
                 }
             };
-            let joined = fanout_eval_sync(bind, body, *join, &snap, items_arr, dispatcher)?;
+            let joined =
+                fanout_eval_sync(bind, body, *join, &snap, items_arr, dispatcher, externs)?;
             ctx.write(path_str(out)?, joined)
         }
         Node::Loop {
@@ -384,10 +508,10 @@ pub fn eval_with_storage<D: Dispatcher>(
                     break;
                 }
                 let snap = ctx.snapshot();
-                if !is_truthy(&eval_expr(cond, &snap)?) {
+                if !is_truthy(&eval_expr_with_externs(cond, &snap, externs)?) {
                     break;
                 }
-                eval_with_storage(body, ctx, dispatcher)?;
+                eval_with_storage_externs(body, ctx, dispatcher, externs)?;
                 n += 1;
                 ctx.write(counter_path, Value::Number(serde_json::Number::from(n)))?;
             }
@@ -400,7 +524,7 @@ pub fn eval_with_storage<D: Dispatcher>(
         } => {
             // body 失敗時の rollback 用 snapshot
             let snap_before = ctx.snapshot();
-            match eval_with_storage(body, ctx, dispatcher) {
+            match eval_with_storage_externs(body, ctx, dispatcher, externs) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     // body の途中 write を破棄 (Try semantic: rollback)
@@ -408,13 +532,13 @@ pub fn eval_with_storage<D: Dispatcher>(
                     if let Some(at) = err_at {
                         ctx.write(path_str(at)?, Value::String(e.to_string()))?;
                     }
-                    eval_with_storage(catch, ctx, dispatcher)
+                    eval_with_storage_externs(catch, ctx, dispatcher, externs)
                 }
             }
         }
         Node::Assign { at, value } => {
             let snap = ctx.snapshot();
-            let v = eval_expr(value, &snap)?;
+            let v = eval_expr_with_externs(value, &snap, externs)?;
             ctx.write(path_str(at)?, v)
         }
     }
@@ -428,6 +552,7 @@ fn fanout_eval_sync<D: Dispatcher>(
     base_snap: &Value,
     items_arr: Vec<Value>,
     dispatcher: &D,
+    externs: &dyn Externs,
 ) -> Result<Value, EvalError> {
     match join {
         JoinMode::All => {
@@ -435,7 +560,7 @@ fn fanout_eval_sync<D: Dispatcher>(
             for item in items_arr {
                 let branch_ctx = write_path(bind, base_snap.clone(), item)?;
                 let storage = MemoryCtx::new(branch_ctx);
-                eval_with_storage(body, &storage, dispatcher)?;
+                eval_with_storage_externs(body, &storage, dispatcher, externs)?;
                 results.push(storage.snapshot());
             }
             Ok(Value::Array(results))
@@ -446,7 +571,7 @@ fn fanout_eval_sync<D: Dispatcher>(
             for item in items_arr {
                 let branch_ctx = write_path(bind, base_snap.clone(), item)?;
                 let storage = MemoryCtx::new(branch_ctx);
-                match eval_with_storage(body, &storage, dispatcher) {
+                match eval_with_storage_externs(body, &storage, dispatcher, externs) {
                     Ok(()) => {
                         winner = Some(storage.snapshot());
                         last_err = None;
@@ -464,7 +589,7 @@ fn fanout_eval_sync<D: Dispatcher>(
             if let Some(first) = items_arr.into_iter().next() {
                 let branch_ctx = write_path(bind, base_snap.clone(), first)?;
                 let storage = MemoryCtx::new(branch_ctx);
-                eval_with_storage(body, &storage, dispatcher)?;
+                eval_with_storage_externs(body, &storage, dispatcher, externs)?;
                 Ok(storage.snapshot())
             } else {
                 Ok(Value::Array(vec![]))
@@ -475,7 +600,7 @@ fn fanout_eval_sync<D: Dispatcher>(
             for item in items_arr {
                 let branch_ctx = write_path(bind, base_snap.clone(), item)?;
                 let storage = MemoryCtx::new(branch_ctx);
-                match eval_with_storage(body, &storage, dispatcher) {
+                match eval_with_storage_externs(body, &storage, dispatcher, externs) {
                     Ok(()) => records.push(
                         serde_json::json!({"status": "fulfilled", "value": storage.snapshot()}),
                     ),
@@ -498,8 +623,18 @@ fn fanout_eval_sync<D: Dispatcher>(
 ///
 /// Returns the updated context (= ctx with `Step.out` path written for each step traversed).
 pub fn eval<D: Dispatcher>(node: &Node, ctx: Value, dispatcher: &D) -> Result<Value, EvalError> {
+    eval_externs(node, ctx, dispatcher, &NoExterns)
+}
+
+/// `eval` + externs registry for `call_extern` Expr resolution.
+pub fn eval_externs<D: Dispatcher>(
+    node: &Node,
+    ctx: Value,
+    dispatcher: &D,
+    externs: &dyn Externs,
+) -> Result<Value, EvalError> {
     let storage = MemoryCtx::new(ctx);
-    eval_with_storage(node, &storage, dispatcher)?;
+    eval_with_storage_externs(node, &storage, dispatcher, externs)?;
     Ok(storage.snapshot())
 }
 
@@ -513,47 +648,72 @@ pub fn is_truthy(v: &Value) -> bool {
     }
 }
 
-/// Evaluate an `Expr` against a context value, returning the resolved JSON value.
+/// Evaluate an `Expr` against a context value, returning the resolved JSON
+/// value. Externs-less compat wrapper — `call_extern` raises `ExternError`.
 pub fn eval_expr(expr: &Expr, ctx: &Value) -> Result<Value, EvalError> {
+    eval_expr_with_externs(expr, ctx, &NoExterns)
+}
+
+/// `eval_expr` + externs registry for `call_extern` Expr resolution.
+pub fn eval_expr_with_externs(
+    expr: &Expr,
+    ctx: &Value,
+    externs: &dyn Externs,
+) -> Result<Value, EvalError> {
+    let ev = |e: &Expr| eval_expr_with_externs(e, ctx, externs);
     match expr {
         Expr::Lit { value } => Ok(value.clone()),
         Expr::Path { at } => read_path(at, ctx),
-        Expr::Eq { lhs, rhs } => Ok(Value::Bool(eval_expr(lhs, ctx)? == eval_expr(rhs, ctx)?)),
-        Expr::Ne { lhs, rhs } => Ok(Value::Bool(eval_expr(lhs, ctx)? != eval_expr(rhs, ctx)?)),
-        Expr::Lt { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a < b),
-        Expr::Le { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a <= b),
-        Expr::Gt { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a > b),
-        Expr::Ge { lhs, rhs } => num_cmp(lhs, rhs, ctx, |a, b| a >= b),
-        Expr::Not { operand } => Ok(Value::Bool(!is_truthy(&eval_expr(operand, ctx)?))),
-        Expr::And { operands } => {
-            for op in operands {
-                if !is_truthy(&eval_expr(op, ctx)?) {
+        Expr::Eq { lhs, rhs } => Ok(Value::Bool(ev(lhs)? == ev(rhs)?)),
+        Expr::Ne { lhs, rhs } => Ok(Value::Bool(ev(lhs)? != ev(rhs)?)),
+        Expr::Lt { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_lt()),
+        Expr::Lte { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_le()),
+        Expr::Gt { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_gt()),
+        Expr::Gte { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_ge()),
+        Expr::Not { arg } => Ok(Value::Bool(!is_truthy(&ev(arg)?))),
+        Expr::And { args } => {
+            for a in args {
+                if !is_truthy(&ev(a)?) {
                     return Ok(Value::Bool(false));
                 }
             }
             Ok(Value::Bool(true))
         }
-        Expr::Or { operands } => {
-            for op in operands {
-                if is_truthy(&eval_expr(op, ctx)?) {
+        Expr::Or { args } => {
+            for a in args {
+                if is_truthy(&ev(a)?) {
                     return Ok(Value::Bool(true));
                 }
             }
             Ok(Value::Bool(false))
         }
-        Expr::Exists { at } => Ok(Value::Bool(read_path(at, ctx).is_ok())),
-        Expr::Add { lhs, rhs } => num_arith(lhs, rhs, ctx, "add", |a, b| Some(a + b)),
-        Expr::Sub { lhs, rhs } => num_arith(lhs, rhs, ctx, "sub", |a, b| Some(a - b)),
-        Expr::Mul { lhs, rhs } => num_arith(lhs, rhs, ctx, "mul", |a, b| Some(a * b)),
-        Expr::Div { lhs, rhs } => num_arith(lhs, rhs, ctx, "div", |a, b| {
+        Expr::Exists { arg } => match ev(arg) {
+            Ok(Value::Null) => Ok(Value::Bool(false)),
+            Ok(_) => Ok(Value::Bool(true)),
+            // canonical: a path to a missing key reads as nil → exists=false
+            Err(EvalError::PathNotFound(_)) => Ok(Value::Bool(false)),
+            Err(e) => Err(e),
+        },
+        Expr::Add { lhs, rhs } => num_arith(&ev(lhs)?, &ev(rhs)?, "add", |a, b| Some(a + b)),
+        Expr::Sub { lhs, rhs } => num_arith(&ev(lhs)?, &ev(rhs)?, "sub", |a, b| Some(a - b)),
+        Expr::Mul { lhs, rhs } => num_arith(&ev(lhs)?, &ev(rhs)?, "mul", |a, b| Some(a * b)),
+        Expr::Div { lhs, rhs } => num_arith(&ev(lhs)?, &ev(rhs)?, "div", |a, b| {
             if b == 0.0 {
                 None
             } else {
                 Some(a / b)
             }
         }),
-        Expr::Len { of } => {
-            let v = eval_expr(of, ctx)?;
+        // Lua `%` semantics (canonical): a - floor(a/b)*b, sign follows rhs.
+        Expr::Mod { lhs, rhs } => num_arith(&ev(lhs)?, &ev(rhs)?, "mod", |a, b| {
+            if b == 0.0 {
+                None
+            } else {
+                Some(a - (a / b).floor() * b)
+            }
+        }),
+        Expr::Len { arg } => {
+            let v = ev(arg)?;
             let n = match &v {
                 Value::Array(a) => a.len(),
                 Value::String(s) => s.chars().count(),
@@ -568,8 +728,8 @@ pub fn eval_expr(expr: &Expr, ctx: &Value) -> Result<Value, EvalError> {
             Ok(Value::Number(serde_json::Number::from(n as u64)))
         }
         Expr::In { needle, haystack } => {
-            let n = eval_expr(needle, ctx)?;
-            let h = eval_expr(haystack, ctx)?;
+            let n = ev(needle)?;
+            let h = ev(haystack)?;
             match h {
                 Value::Array(a) => Ok(Value::Bool(a.iter().any(|e| e == &n))),
                 other => Err(EvalError::DispatcherError {
@@ -577,6 +737,13 @@ pub fn eval_expr(expr: &Expr, ctx: &Value) -> Result<Value, EvalError> {
                     msg: format!("in: haystack must be array, got {other:?}"),
                 }),
             }
+        }
+        Expr::CallExtern { ref_, args } => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(ev(a)?);
+            }
+            externs.call(ref_, &vals)
         }
     }
 }
@@ -595,25 +762,41 @@ fn to_f64(v: &Value, op: &str) -> Result<f64, EvalError> {
     }
 }
 
-fn num_cmp<F>(lhs: &Expr, rhs: &Expr, ctx: &Value, cmp: F) -> Result<Value, EvalError>
+/// Ordering comparison over two evaluated values. Mirrors canonical Lua
+/// `< / <= / > / >=`: both numbers (f64) or both strings (lexicographic
+/// byte order, same as Lua's string comparison for UTF-8); anything else
+/// raises.
+fn ord_cmp<F>(lv: &Value, rv: &Value, f: F) -> Result<Value, EvalError>
 where
-    F: Fn(f64, f64) -> bool,
+    F: Fn(std::cmp::Ordering) -> bool,
 {
-    let lv = eval_expr(lhs, ctx)?;
-    let rv = eval_expr(rhs, ctx)?;
-    let l = to_f64(&lv, "cmp")?;
-    let r = to_f64(&rv, "cmp")?;
-    Ok(Value::Bool(cmp(l, r)))
+    let ord = match (lv, rv) {
+        (Value::Number(_), Value::Number(_)) => {
+            let l = to_f64(lv, "cmp")?;
+            let r = to_f64(rv, "cmp")?;
+            l.partial_cmp(&r)
+                .ok_or_else(|| EvalError::DispatcherError {
+                    ref_: "expr.cmp".into(),
+                    msg: "non-comparable numbers (NaN)".into(),
+                })?
+        }
+        (Value::String(l), Value::String(r)) => l.cmp(r),
+        (l, r) => {
+            return Err(EvalError::DispatcherError {
+                ref_: "expr.cmp".into(),
+                msg: format!("cmp: both sides must be numbers or strings, got {l:?} vs {r:?}"),
+            })
+        }
+    };
+    Ok(Value::Bool(f(ord)))
 }
 
-fn num_arith<F>(lhs: &Expr, rhs: &Expr, ctx: &Value, op: &str, f: F) -> Result<Value, EvalError>
+fn num_arith<F>(lv: &Value, rv: &Value, op: &str, f: F) -> Result<Value, EvalError>
 where
     F: Fn(f64, f64) -> Option<f64>,
 {
-    let lv = eval_expr(lhs, ctx)?;
-    let rv = eval_expr(rhs, ctx)?;
-    let l = to_f64(&lv, op)?;
-    let r = to_f64(&rv, op)?;
+    let l = to_f64(lv, op)?;
+    let r = to_f64(rv, op)?;
     let result = f(l, r).ok_or_else(|| EvalError::DispatcherError {
         ref_: format!("expr.{op}"),
         msg: "arithmetic failure (e.g. division by zero)".into(),

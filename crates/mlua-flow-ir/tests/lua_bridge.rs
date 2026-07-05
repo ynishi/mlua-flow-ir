@@ -216,3 +216,130 @@ fn lua_eval_dispatcher_returning_nil_for_unknown_ref_errors() {
 
     assert!(result.is_err(), "expect dispatcher error to propagate");
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// call_extern via externs table (canonical opts.externs parity)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn lua_eval_call_extern_resolves_lua_fn() {
+    let lua = setup_lua();
+    // extern の実体は任意の pure Lua function = LuaScript 直実行 Hatch。
+    // UCB1 で必要な sqrt / ln をそのまま whitelist して IR から呼ぶ。
+    let result: mlua::Value = lua
+        .load(
+            r#"
+        local node = {
+            kind = "assign",
+            at = { op = "path", at = "$.score" },
+            value = {
+                op = "call_extern", ref = "ucb.bonus",
+                args = {
+                    { op = "path", at = "$.total" },
+                    { op = "path", at = "$.n" },
+                },
+            },
+        }
+        local externs = {
+            ["ucb.bonus"] = function(total, n)
+                return math.sqrt(2 * math.log(total + 1) / n)
+            end,
+        }
+        local function dispatcher(_r, _i) end
+        return flow.eval(node, { total = 0, n = 1 }, dispatcher, externs)
+    "#,
+        )
+        .eval()
+        .unwrap();
+
+    let t: mlua::Table = match result {
+        mlua::Value::Table(t) => t,
+        _ => panic!("expected table"),
+    };
+    let score: f64 = t.get("score").unwrap();
+    assert!(score.abs() < 1e-12, "sqrt(2*ln(1)/1) = 0, got {score}");
+}
+
+#[test]
+fn lua_eval_call_extern_unregistered_errors() {
+    let lua = setup_lua();
+    let result = lua
+        .load(
+            r#"
+        local node = {
+            kind = "assign",
+            at = { op = "path", at = "$.x" },
+            value = { op = "call_extern", ref = "nope", args = {} },
+        }
+        local function dispatcher(_r, _i) end
+        return flow.eval(node, {}, dispatcher, {})
+    "#,
+        )
+        .eval::<mlua::Value>();
+    assert!(result.is_err(), "unregistered extern must raise");
+}
+
+#[test]
+fn lua_eval_call_extern_without_externs_table_errors() {
+    let lua = setup_lua();
+    // 4th arg 省略 = NoExterns → canonical "requires opts.externs" parity
+    let result = lua
+        .load(
+            r#"
+        local node = {
+            kind = "assign",
+            at = { op = "path", at = "$.x" },
+            value = { op = "call_extern", ref = "f", args = {} },
+        }
+        local function dispatcher(_r, _i) end
+        return flow.eval(node, {}, dispatcher)
+    "#,
+        )
+        .eval::<mlua::Value>();
+    assert!(result.is_err(), "call_extern without externs must raise");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// canonical wire format: gte / lte tags parse via Lua bridge
+// ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn lua_eval_gte_lte_wire_tags() {
+    let lua = setup_lua();
+    let result: mlua::Value = lua
+        .load(
+            r#"
+        local node = {
+            kind = "branch",
+            cond = {
+                op = "and",
+                args = {
+                    { op = "gte", lhs = { op = "lit", value = 3 }, rhs = { op = "lit", value = 3 } },
+                    { op = "lte", lhs = { op = "lit", value = 2 }, rhs = { op = "lit", value = 3 } },
+                },
+            },
+            ["then"] = {
+                kind = "assign",
+                at = { op = "path", at = "$.r" },
+                value = { op = "lit", value = "ok" },
+            },
+            ["else"] = {
+                kind = "assign",
+                at = { op = "path", at = "$.r" },
+                value = { op = "lit", value = "ng" },
+            },
+        }
+        local function dispatcher(_r, _i) end
+        return flow.eval(node, {}, dispatcher)
+    "#,
+        )
+        .eval()
+        .unwrap();
+
+    let t: mlua::Table = match result {
+        mlua::Value::Table(t) => t,
+        _ => panic!("expected table"),
+    };
+    let r: String = t.get("r").unwrap();
+    assert_eq!(r, "ok");
+}

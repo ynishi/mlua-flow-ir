@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use mlua_flow_ir::{eval_async, AsyncDispatcher, EvalError, Expr, Node};
+use mlua_flow_ir::{
+    eval_async, eval_async_externs, AsyncDispatcher, EvalError, Expr, ExternMap, Node,
+};
 use serde_json::{json, Value};
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -211,6 +213,53 @@ async fn eval_async_with_actual_await_in_dispatch() {
         .unwrap();
     assert_eq!(r["r1"], json!("hello"));
     assert_eq!(r["r2"], json!("hello"));
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// call_extern via async path (externs must keep the future Send)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_async_call_extern_with_extern_map() {
+    let mut externs = ExternMap::new();
+    externs.register("math.sqrt", |args: &[Value]| {
+        let x = args[0].as_f64().ok_or_else(|| EvalError::ExternError {
+            ref_: "math.sqrt".into(),
+            msg: "expected number".into(),
+        })?;
+        Ok(json!(x.sqrt()))
+    });
+
+    let n = Node::Assign {
+        at: Expr::Path {
+            at: "$.root".into(),
+        },
+        value: Expr::CallExtern {
+            ref_: "math.sqrt".into(),
+            args: vec![Expr::Path { at: "$.n".into() }],
+        },
+    };
+    // spawn 経由で走らせて future が Send であることも同時に検証
+    let handle = tokio::spawn(async move {
+        eval_async_externs(&n, json!({ "n": 16.0 }), &FixtureAsyncDispatcher, &externs).await
+    });
+    let r = handle.await.unwrap().unwrap();
+    assert_eq!(r["root"], json!(4.0));
+}
+
+#[tokio::test]
+async fn eval_async_call_extern_without_externs_errors() {
+    let n = Node::Assign {
+        at: Expr::Path { at: "$.x".into() },
+        value: Expr::CallExtern {
+            ref_: "f".into(),
+            args: vec![],
+        },
+    };
+    let err = eval_async(&n, json!({}), &FixtureAsyncDispatcher)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EvalError::ExternError { .. }), "{err:?}");
 }
 
 // ──────────────────────────────────────────────────────────────────────────

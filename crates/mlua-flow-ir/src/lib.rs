@@ -23,8 +23,9 @@
 // ──────────────────────────────────────────────────────────────────────────
 
 pub use flow_ir_core::{
-    eval, eval_expr, eval_with_storage, is_truthy, read_path, write_path, CtxStorage, Dispatcher,
-    EvalError, Expr, JoinMode, MemoryCtx, Node,
+    eval, eval_expr, eval_expr_with_externs, eval_externs, eval_with_storage,
+    eval_with_storage_externs, is_truthy, read_path, write_path, CtxStorage, Dispatcher, EvalError,
+    Expr, ExternFn, ExternMap, Externs, JoinMode, MemoryCtx, NoExterns, Node,
 };
 
 use serde_json::Value;
@@ -89,11 +90,26 @@ pub trait AsyncDispatcher: Send + Sync {
 /// `Arc<dyn CtxStorage>` 経由で ctx を共有することで、 dispatch().await suspend
 /// 中に外部 task が同じ ctx に `write` できる (= dynamic State injection 経路)。
 /// Step 評価の境界で `ctx.snapshot()` を取って Expr eval に渡す。
-#[async_recursion]
 pub async fn eval_async_with_storage<D>(
     node: &Node,
     ctx: Arc<dyn CtxStorage>,
     dispatcher: &D,
+) -> Result<(), EvalError>
+where
+    D: AsyncDispatcher + ?Sized,
+{
+    eval_async_with_storage_externs(node, ctx, dispatcher, &NoExterns).await
+}
+
+/// `eval_async_with_storage` + externs registry for `call_extern` Expr
+/// resolution. `externs` must be `Sync` so the recursive future stays `Send`
+/// (host executors spawn it across threads).
+#[async_recursion]
+pub async fn eval_async_with_storage_externs<D>(
+    node: &Node,
+    ctx: Arc<dyn CtxStorage>,
+    dispatcher: &D,
+    externs: &(dyn Externs + Sync),
 ) -> Result<(), EvalError>
 where
     D: AsyncDispatcher + ?Sized,
@@ -105,7 +121,7 @@ where
             // input の値は確定。 write_target の `out` path への write は
             // dispatch 完了後に共有 ctx を直接更新。
             let snap = ctx.snapshot();
-            let input = eval_expr(in_, &snap)?;
+            let input = eval_expr_with_externs(in_, &snap, externs)?;
             let output =
                 dispatcher
                     .dispatch(ref_, input)
@@ -118,15 +134,19 @@ where
         }
         Node::Seq { children } => {
             for child in children {
-                eval_async_with_storage(child, ctx.clone(), dispatcher).await?;
+                eval_async_with_storage_externs(child, ctx.clone(), dispatcher, externs).await?;
             }
             Ok(())
         }
         Node::Branch { cond, then_, else_ } => {
             let snap = ctx.snapshot();
-            match eval_expr(cond, &snap)? {
-                Value::Bool(true) => eval_async_with_storage(then_, ctx, dispatcher).await,
-                Value::Bool(false) => eval_async_with_storage(else_, ctx, dispatcher).await,
+            match eval_expr_with_externs(cond, &snap, externs)? {
+                Value::Bool(true) => {
+                    eval_async_with_storage_externs(then_, ctx, dispatcher, externs).await
+                }
+                Value::Bool(false) => {
+                    eval_async_with_storage_externs(else_, ctx, dispatcher, externs).await
+                }
                 other => Err(EvalError::NonBoolCond(other)),
             }
         }
@@ -136,7 +156,7 @@ where
             body,
             join,
             out,
-        } => fanout_eval(items, bind, body, *join, out, ctx, dispatcher).await,
+        } => fanout_eval(items, bind, body, *join, out, ctx, dispatcher, externs).await,
         Node::Loop {
             counter,
             cond,
@@ -151,10 +171,10 @@ where
                     break;
                 }
                 let snap = ctx.snapshot();
-                if !is_truthy(&eval_expr(cond, &snap)?) {
+                if !is_truthy(&eval_expr_with_externs(cond, &snap, externs)?) {
                     break;
                 }
-                eval_async_with_storage(body, ctx.clone(), dispatcher).await?;
+                eval_async_with_storage_externs(body, ctx.clone(), dispatcher, externs).await?;
                 n += 1;
                 ctx.write(&counter_path, Value::Number(serde_json::Number::from(n)))?;
             }
@@ -166,20 +186,20 @@ where
             err_at,
         } => {
             let snap_before = ctx.snapshot();
-            match eval_async_with_storage(body, ctx.clone(), dispatcher).await {
+            match eval_async_with_storage_externs(body, ctx.clone(), dispatcher, externs).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     ctx.replace(snap_before);
                     if let Some(at) = err_at {
                         ctx.write(path_str_async(at)?, Value::String(e.to_string()))?;
                     }
-                    eval_async_with_storage(catch, ctx, dispatcher).await
+                    eval_async_with_storage_externs(catch, ctx, dispatcher, externs).await
                 }
             }
         }
         Node::Assign { at, value } => {
             let snap = ctx.snapshot();
-            let v = eval_expr(value, &snap)?;
+            let v = eval_expr_with_externs(value, &snap, externs)?;
             ctx.write(path_str_async(at)?, v)
         }
     }
@@ -192,8 +212,21 @@ pub async fn eval_async<D>(node: &Node, ctx: Value, dispatcher: &D) -> Result<Va
 where
     D: AsyncDispatcher + ?Sized,
 {
+    eval_async_externs(node, ctx, dispatcher, &NoExterns).await
+}
+
+/// `eval_async` + externs registry for `call_extern` Expr resolution.
+pub async fn eval_async_externs<D>(
+    node: &Node,
+    ctx: Value,
+    dispatcher: &D,
+    externs: &(dyn Externs + Sync),
+) -> Result<Value, EvalError>
+where
+    D: AsyncDispatcher + ?Sized,
+{
     let storage: Arc<dyn CtxStorage> = MemoryCtx::shared(ctx);
-    eval_async_with_storage(node, storage.clone(), dispatcher).await?;
+    eval_async_with_storage_externs(node, storage.clone(), dispatcher, externs).await?;
     Ok(storage.snapshot())
 }
 
@@ -211,6 +244,7 @@ fn path_str_async(expr: &Expr) -> Result<&str, EvalError> {
 /// を持ち、 branch 内で write しても共有 ctx には影響しない (= snapshot 切り出し
 /// semantic)。 集約結果は最後に共有 ctx の `out` path に write。
 #[async_recursion]
+#[allow(clippy::too_many_arguments)]
 async fn fanout_eval<D>(
     items: &Expr,
     bind: &Expr,
@@ -219,6 +253,7 @@ async fn fanout_eval<D>(
     out: &Expr,
     ctx: Arc<dyn CtxStorage>,
     dispatcher: &D,
+    externs: &(dyn Externs + Sync),
 ) -> Result<(), EvalError>
 where
     D: AsyncDispatcher + ?Sized,
@@ -226,7 +261,7 @@ where
     use futures::future::{join_all, select_ok, FutureExt};
 
     let snap = ctx.snapshot();
-    let items_val = eval_expr(items, &snap)?;
+    let items_val = eval_expr_with_externs(items, &snap, externs)?;
     let items_arr = match items_val {
         Value::Array(a) => a,
         other => {
@@ -251,7 +286,7 @@ where
     // 共有して走る。
     let branch_futs: Vec<_> = branches
         .iter()
-        .map(|b| eval_async_with_storage(body, b.clone(), dispatcher))
+        .map(|b| eval_async_with_storage_externs(body, b.clone(), dispatcher, externs))
         .collect();
 
     let joined: Value = match join {
@@ -345,13 +380,52 @@ impl<'a> Dispatcher for LuaDispatcher<'a> {
     }
 }
 
+/// Lua function table を Rust `Externs` trait に wrap した adapter。
+///
+/// canonical `opts.externs` (flow-ir-lua) と同型: table の各 entry は
+/// pure Lua function で、 `call_extern` Expr の ref で引かれ、 評価済み args
+/// を positional に受けて値を返す。 これが「LuaScript 直実行 Hatch」の
+/// Rust 側の受け口 (extern の実体は任意の Lua closure)。
+struct LuaExterns<'a> {
+    lua: &'a mlua::Lua,
+    table: mlua::Table,
+}
+
+impl<'a> flow_ir_core::Externs for LuaExterns<'a> {
+    fn call(&self, ref_: &str, args: &[Value]) -> Result<Value, EvalError> {
+        let func: mlua::Function = self.table.get(ref_).map_err(|_| EvalError::ExternError {
+            ref_: ref_.into(),
+            msg: "not registered in externs (or not a function)".into(),
+        })?;
+        let mut lua_args = mlua::MultiValue::new();
+        for a in args {
+            lua_args.push_back(self.lua.to_value(a).map_err(|e| EvalError::ExternError {
+                ref_: ref_.into(),
+                msg: format!("to_value: {}", e),
+            })?);
+        }
+        let result: mlua::Value = func.call(lua_args).map_err(|e| EvalError::ExternError {
+            ref_: ref_.into(),
+            msg: format!("lua call: {}", e),
+        })?;
+        self.lua
+            .from_value(result)
+            .map_err(|e| EvalError::ExternError {
+                ref_: ref_.into(),
+                msg: format!("from_value: {}", e),
+            })
+    }
+}
+
 /// Register the flow module table with Lua.
 ///
-/// v0.0.3 full impl — exposes:
+/// Exposes:
 ///
 /// - `flow.version` (= string): crate version
-/// - `flow.eval(node_table, ctx_table, dispatcher_fn) -> result_table`:
-///   Lua-side entry to evaluate a flow.ir BluePrint with a Lua dispatcher fn
+/// - `flow.eval(node_table, ctx_table, dispatcher_fn, externs_table?) ->
+///   result_table`: Lua-side entry to evaluate a flow.ir BluePrint with a
+///   Lua dispatcher fn. Optional 4th arg is a table of pure Lua functions
+///   resolved by `call_extern` Expr (canonical `opts.externs` parity).
 ///
 /// # Lua usage
 ///
@@ -373,6 +447,17 @@ impl<'a> Dispatcher for LuaDispatcher<'a> {
 ///
 /// local result = flow.eval(node, { input = "hello" }, dispatcher)
 /// assert(result.output == "HELLO")
+///
+/// -- call_extern: whitelist pure Lua fns via the externs table
+/// local node2 = {
+///   kind = "assign",
+///   at = { op = "path", at = "$.root" },
+///   value = { op = "call_extern", ref = "math.sqrt",
+///             args = { { op = "path", at = "$.n" } } },
+/// }
+/// local result2 = flow.eval(node2, { n = 9 }, dispatcher,
+///                           { ["math.sqrt"] = math.sqrt })
+/// assert(result2.root == 3)
 /// ```
 pub fn module(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     let t = lua.create_table()?;
@@ -380,7 +465,12 @@ pub fn module(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
 
     let eval_fn = lua.create_function(
         |lua_inner: &mlua::Lua,
-         (node_val, ctx_val, dispatcher_fn): (mlua::Value, mlua::Value, mlua::Function)| {
+         (node_val, ctx_val, dispatcher_fn, externs_val): (
+            mlua::Value,
+            mlua::Value,
+            mlua::Function,
+            Option<mlua::Table>,
+        )| {
             let node: Node = lua_inner
                 .from_value(node_val)
                 .map_err(|e| mlua::Error::external(format!("node parse: {}", e)))?;
@@ -392,8 +482,17 @@ pub fn module(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
                 lua: lua_inner,
                 func: dispatcher_fn,
             };
-            let result = eval(&node, ctx, &dispatcher)
-                .map_err(|e| mlua::Error::external(format!("eval: {}", e)))?;
+            let result = match externs_val {
+                Some(table) => {
+                    let externs = LuaExterns {
+                        lua: lua_inner,
+                        table,
+                    };
+                    eval_externs(&node, ctx, &dispatcher, &externs)
+                }
+                None => eval(&node, ctx, &dispatcher),
+            }
+            .map_err(|e| mlua::Error::external(format!("eval: {}", e)))?;
             lua_inner.to_value(&result)
         },
     )?;
