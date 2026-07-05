@@ -6,6 +6,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.1.0] — 2026-07-05
+
+### Added
+
+- `Expr::CallExtern { ref, args }` — canonical value-shape Hatch. Registered via the new `Externs` trait (Dispatcher-style DI); `ExternMap` for host-side Rust closures; `NoExterns` fallback used by externs-less compat wrappers; `EvalError::ExternError` for unregistered / faulty refs.
+- `Expr::Mod` — modulo with canonical Lua `%` semantics (result takes the sign of `rhs`; modulo by zero raises).
+- Externs-threaded evaluator entry points: `eval_externs` / `eval_with_storage_externs` / `eval_expr_with_externs` (sync, `flow-ir-core`) and `eval_async_externs` / `eval_async_with_storage_externs` (async, `mlua-flow-ir`). Externs-less APIs (`eval`, `eval_expr`, `eval_async`, ...) remain as compat wrappers that delegate through `NoExterns`.
+- `mlua-flow-ir` Lua module: `flow.eval(node, ctx, dispatcher, externs_table?)` — optional 4th arg is a table of pure Lua functions resolved by `call_extern` (canonical `opts.externs` parity, "LuaScript-direct" extension hatch).
+
+### Changed
+
+- **Breaking (wire format)** — `Expr` op tags and field names now match canonical `flow-ir-lua` (`flow/ir/schema.lua`) verbatim: `ge` / `le` become `gte` / `lte`; `and` / `or` use `args` (was `operands`); `not` / `len` / `exists` use `arg` (was `operand` / `of` / `at`). `exists.arg` is now an `Expr` (previously a string path).
+- **Breaking (semantics)** — `Exists` now returns `false` for JSON `null` values, mirroring canonical `arg ~= nil` semantics (JSON `null` maps to Lua `nil`). Previously a present-but-null value counted as existing.
+- **Breaking (comparison)** — `Lt` / `Lte` / `Gt` / `Gte` now accept string operands (lexicographic byte order, canonical Lua `<` parity) in addition to numbers. Mixed / other types still raise.
+- Crate top-level doc updated to reflect the enlarged Node / Expr op surface and the new `Externs` DI layer.
+
 ## [0.0.4] — 2026-06-28
 
 ### Changed
