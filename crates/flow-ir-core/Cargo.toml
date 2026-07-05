@@ -1,6 +1,6 @@
 [package]
 name = "flow-ir-core"
-version = "0.1.0"
+version = "0.1.1"
 description = "flow.ir Pure Rust schema + sync interpreter — Node / Expr / Dispatcher / eval (no mlua, no async)"
 documentation = "https://docs.rs/flow-ir-core"
 keywords = ["flow", "ir", "interpreter", "dsl", "dispatcher"]
@@ -11,7 +11,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

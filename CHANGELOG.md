@@ -18,6 +18,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Security
 
+## [0.1.1] — 2026-07-05
+
+### Fixed
+
+- `cargo publish` warning "readme `../../README.md` appears to be a path outside of the package" for both crates. `readme` is now declared per-crate as `readme = "README.md"` (resolved relative to the crate directory) instead of inherited from `[workspace.package]`. No behavioural change; packaging metadata only.
+
 ## [0.1.0] — 2026-07-05
 
 ### Added
