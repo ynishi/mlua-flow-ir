@@ -43,10 +43,10 @@ async fn eval_async_node_step() {
     let n = Node::Step {
         ref_: "uppercase".into(),
         in_: Expr::Path {
-            at: "$.input".into(),
+            at: "$.input".parse().unwrap(),
         },
         out: Expr::Path {
-            at: "$.output".into(),
+            at: "$.output".parse().unwrap(),
         },
     };
     let r = eval_async(&n, json!({ "input": "hi" }), &FixtureAsyncDispatcher)
@@ -62,15 +62,17 @@ async fn eval_async_node_seq() {
             Node::Step {
                 ref_: "uppercase".into(),
                 in_: Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().unwrap(),
                 },
-                out: Expr::Path { at: "$.up".into() },
+                out: Expr::Path {
+                    at: "$.up".parse().unwrap(),
+                },
             },
             Node::Step {
                 ref_: "count_one".into(),
                 in_: Expr::Lit { value: json!(null) },
                 out: Expr::Path {
-                    at: "$.count".into(),
+                    at: "$.count".parse().unwrap(),
                 },
             },
         ],
@@ -121,7 +123,9 @@ async fn eval_async_dispatcher_error_propagates() {
     let n = Node::Step {
         ref_: "unknown".into(),
         in_: Expr::Lit { value: json!(null) },
-        out: Expr::Path { at: "$.x".into() },
+        out: Expr::Path {
+            at: "$.x".parse().unwrap(),
+        },
     };
     let r = eval_async(&n, json!({}), &FixtureAsyncDispatcher).await;
     assert!(matches!(r, Err(EvalError::DispatcherError { .. })));
@@ -136,7 +140,9 @@ async fn eval_async_accepts_dyn_dispatcher() {
     let n = Node::Step {
         ref_: "uppercase".into(),
         in_: Expr::Lit { value: json!("x") },
-        out: Expr::Path { at: "$.out".into() },
+        out: Expr::Path {
+            at: "$.out".parse().unwrap(),
+        },
     };
     let dispatcher: &dyn AsyncDispatcher = &FixtureAsyncDispatcher;
     let r = eval_async(&n, json!({}), dispatcher).await.unwrap();
@@ -154,14 +160,18 @@ async fn eval_async_nested_seq_branch_seq() {
             Node::Step {
                 ref_: "uppercase".into(),
                 in_: Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().unwrap(),
                 },
-                out: Expr::Path { at: "$.a".into() },
+                out: Expr::Path {
+                    at: "$.a".parse().unwrap(),
+                },
             },
             Node::Step {
                 ref_: "count_one".into(),
                 in_: Expr::Lit { value: json!(null) },
-                out: Expr::Path { at: "$.b".into() },
+                out: Expr::Path {
+                    at: "$.b".parse().unwrap(),
+                },
             },
         ],
     };
@@ -173,7 +183,7 @@ async fn eval_async_nested_seq_branch_seq() {
                 ref_: "count_one".into(),
                 in_: Expr::Lit { value: json!(null) },
                 out: Expr::Path {
-                    at: "$.skipped".into(),
+                    at: "$.skipped".parse().unwrap(),
                 },
             }),
         }],
@@ -197,14 +207,20 @@ async fn eval_async_with_actual_await_in_dispatch() {
             Node::Step {
                 ref_: "delay_echo".into(),
                 in_: Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().unwrap(),
                 },
-                out: Expr::Path { at: "$.r1".into() },
+                out: Expr::Path {
+                    at: "$.r1".parse().unwrap(),
+                },
             },
             Node::Step {
                 ref_: "delay_echo".into(),
-                in_: Expr::Path { at: "$.r1".into() },
-                out: Expr::Path { at: "$.r2".into() },
+                in_: Expr::Path {
+                    at: "$.r1".parse().unwrap(),
+                },
+                out: Expr::Path {
+                    at: "$.r2".parse().unwrap(),
+                },
             },
         ],
     };
@@ -232,11 +248,13 @@ async fn eval_async_call_extern_with_extern_map() {
 
     let n = Node::Assign {
         at: Expr::Path {
-            at: "$.root".into(),
+            at: "$.root".parse().unwrap(),
         },
         value: Expr::CallExtern {
             ref_: "math.sqrt".into(),
-            args: vec![Expr::Path { at: "$.n".into() }],
+            args: vec![Expr::Path {
+                at: "$.n".parse().unwrap(),
+            }],
         },
     };
     // spawn 経由で走らせて future が Send であることも同時に検証
@@ -250,7 +268,9 @@ async fn eval_async_call_extern_with_extern_map() {
 #[tokio::test]
 async fn eval_async_call_extern_without_externs_errors() {
     let n = Node::Assign {
-        at: Expr::Path { at: "$.x".into() },
+        at: Expr::Path {
+            at: "$.x".parse().unwrap(),
+        },
         value: Expr::CallExtern {
             ref_: "f".into(),
             args: vec![],
@@ -270,24 +290,24 @@ fn make_branch() -> Node {
     Node::Branch {
         cond: Expr::Eq {
             lhs: Box::new(Expr::Path {
-                at: "$.flag".into(),
+                at: "$.flag".parse().unwrap(),
             }),
             rhs: Box::new(Expr::Lit { value: json!(true) }),
         },
         then_: Box::new(Node::Step {
             ref_: "uppercase".into(),
             in_: Expr::Path {
-                at: "$.input".into(),
+                at: "$.input".parse().unwrap(),
             },
             out: Expr::Path {
-                at: "$.result".into(),
+                at: "$.result".parse().unwrap(),
             },
         }),
         else_: Box::new(Node::Step {
             ref_: "count_one".into(),
             in_: Expr::Lit { value: json!(null) },
             out: Expr::Path {
-                at: "$.result".into(),
+                at: "$.result".parse().unwrap(),
             },
         }),
     }

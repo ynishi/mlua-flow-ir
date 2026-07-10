@@ -38,14 +38,18 @@ fn expr_lit_returns_literal() {
 
 #[test]
 fn expr_path_root() {
-    let e = Expr::Path { at: "$".into() };
+    let e = Expr::Path {
+        at: "$".parse().unwrap(),
+    };
     let ctx = json!({ "k": "v" });
     assert_eq!(eval_expr(&e, &ctx).unwrap(), ctx);
 }
 
 #[test]
 fn expr_path_reads_nested() {
-    let e = Expr::Path { at: "$.a.b".into() };
+    let e = Expr::Path {
+        at: "$.a.b".parse().unwrap(),
+    };
     assert_eq!(
         eval_expr(&e, &json!({ "a": { "b": "hello" } })).unwrap(),
         json!("hello")
@@ -55,7 +59,7 @@ fn expr_path_reads_nested() {
 #[test]
 fn expr_path_missing_returns_error() {
     let e = Expr::Path {
-        at: "$.missing".into(),
+        at: "$.missing".parse().unwrap(),
     };
     assert!(matches!(
         eval_expr(&e, &json!({})),
@@ -63,21 +67,27 @@ fn expr_path_missing_returns_error() {
     ));
 }
 
+/// Malformed path syntax is rejected at *deserialize* time now (the `Path`
+/// type cannot represent it at all — parse-don't-validate), not at `eval`
+/// time. This mirrors what `expr_path_invalid_prefix` used to assert via a
+/// directly-constructed `Expr::Path { at: "no.prefix".into() }` (impossible
+/// to construct now that `at` is a typed `Path`).
 #[test]
-fn expr_path_invalid_prefix() {
-    let e = Expr::Path {
-        at: "no.prefix".into(),
-    };
-    assert!(matches!(
-        eval_expr(&e, &json!({})),
-        Err(EvalError::InvalidPath(_))
-    ));
+fn expr_path_invalid_prefix_rejected_at_deserialize_time() {
+    let err = serde_json::from_value::<Expr>(json!({
+        "op": "path",
+        "at": "no.prefix",
+    }))
+    .unwrap_err();
+    assert!(err.to_string().contains("no.prefix"), "{err}");
 }
 
 #[test]
 fn expr_eq_returns_bool() {
     let e = Expr::Eq {
-        lhs: Box::new(Expr::Path { at: "$.x".into() }),
+        lhs: Box::new(Expr::Path {
+            at: "$.x".parse().unwrap(),
+        }),
         rhs: Box::new(Expr::Lit { value: json!("ok") }),
     };
     assert_eq!(eval_expr(&e, &json!({ "x": "ok" })).unwrap(), json!(true));
@@ -93,10 +103,10 @@ fn node_step_writes_output_to_ctx() {
     let n = Node::Step {
         ref_: "uppercase".into(),
         in_: Expr::Path {
-            at: "$.input".into(),
+            at: "$.input".parse().unwrap(),
         },
         out: Expr::Path {
-            at: "$.output".into(),
+            at: "$.output".parse().unwrap(),
         },
     };
     let result = eval(&n, json!({ "input": "hello" }), &FixtureDispatcher).unwrap();
@@ -109,7 +119,7 @@ fn node_step_writes_nested_output() {
         ref_: "count_one".into(),
         in_: Expr::Lit { value: json!(null) },
         out: Expr::Path {
-            at: "$.deep.nested.count".into(),
+            at: "$.deep.nested.count".parse().unwrap(),
         },
     };
     let result = eval(&n, json!({}), &FixtureDispatcher).unwrap();
@@ -121,7 +131,9 @@ fn node_step_dispatcher_error_propagates() {
     let n = Node::Step {
         ref_: "unknown_ref".into(),
         in_: Expr::Lit { value: json!(null) },
-        out: Expr::Path { at: "$.x".into() },
+        out: Expr::Path {
+            at: "$.x".parse().unwrap(),
+        },
     };
     assert!(matches!(
         eval(&n, json!({}), &FixtureDispatcher),
@@ -136,15 +148,17 @@ fn node_seq_chains_steps() {
             Node::Step {
                 ref_: "uppercase".into(),
                 in_: Expr::Path {
-                    at: "$.input".into(),
+                    at: "$.input".parse().unwrap(),
                 },
-                out: Expr::Path { at: "$.up".into() },
+                out: Expr::Path {
+                    at: "$.up".parse().unwrap(),
+                },
             },
             Node::Step {
                 ref_: "count_one".into(),
                 in_: Expr::Lit { value: json!(null) },
                 out: Expr::Path {
-                    at: "$.count".into(),
+                    at: "$.count".parse().unwrap(),
                 },
             },
         ],
@@ -194,24 +208,24 @@ fn make_branch() -> Node {
     Node::Branch {
         cond: Expr::Eq {
             lhs: Box::new(Expr::Path {
-                at: "$.flag".into(),
+                at: "$.flag".parse().unwrap(),
             }),
             rhs: Box::new(Expr::Lit { value: json!(true) }),
         },
         then_: Box::new(Node::Step {
             ref_: "uppercase".into(),
             in_: Expr::Path {
-                at: "$.input".into(),
+                at: "$.input".parse().unwrap(),
             },
             out: Expr::Path {
-                at: "$.result".into(),
+                at: "$.result".parse().unwrap(),
             },
         }),
         else_: Box::new(Node::Step {
             ref_: "count_one".into(),
             in_: Expr::Lit { value: json!(null) },
             out: Expr::Path {
-                at: "$.result".into(),
+                at: "$.result".parse().unwrap(),
             },
         }),
     }
@@ -283,7 +297,9 @@ fn closure_dispatcher_works() {
     let n = Node::Step {
         ref_: "anything".into(),
         in_: Expr::Lit { value: json!(null) },
-        out: Expr::Path { at: "$.r".into() },
+        out: Expr::Path {
+            at: "$.r".parse().unwrap(),
+        },
     };
     let result = eval(&n, json!({}), &dispatcher).unwrap();
     assert_eq!(result, json!({ "r": "closure-result" }));

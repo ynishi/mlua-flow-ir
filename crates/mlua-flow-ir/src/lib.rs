@@ -50,7 +50,7 @@
 pub use flow_ir_core::{
     eval, eval_expr, eval_expr_with_externs, eval_externs, eval_with_storage,
     eval_with_storage_externs, is_truthy, read_path, write_path, CtxStorage, Dispatcher, EvalError,
-    Expr, ExternFn, ExternMap, Externs, JoinMode, MemoryCtx, NoExterns, Node,
+    Expr, ExternFn, ExternMap, Externs, JoinMode, MemoryCtx, NoExterns, Node, Path, PathParseError,
 };
 
 use serde_json::Value;
@@ -120,7 +120,7 @@ where
                         ref_: ref_.clone(),
                         msg: e.to_string(),
                     })?;
-            ctx.write(path_str_async(out)?, output)
+            ctx.write(&path_of_async(out)?.to_string(), output)
         }
         Node::Seq { children } => {
             for child in children {
@@ -153,7 +153,7 @@ where
             body,
             max,
         } => {
-            let counter_path = path_str_async(counter)?.to_string();
+            let counter_path = path_of_async(counter)?.to_string();
             ctx.write(&counter_path, Value::Number(serde_json::Number::from(0u32)))?;
             let mut n: u32 = 0;
             loop {
@@ -181,7 +181,10 @@ where
                 Err(e) => {
                     ctx.replace(snap_before);
                     if let Some(at) = err_at {
-                        ctx.write(path_str_async(at)?, Value::String(e.to_string()))?;
+                        ctx.write(
+                            &path_of_async(at)?.to_string(),
+                            Value::String(e.to_string()),
+                        )?;
                     }
                     eval_async_with_storage_externs(catch, ctx, dispatcher, externs).await
                 }
@@ -190,7 +193,7 @@ where
         Node::Assign { at, value } => {
             let snap = ctx.snapshot();
             let v = eval_expr_with_externs(value, &snap, externs)?;
-            ctx.write(path_str_async(at)?, v)
+            ctx.write(&path_of_async(at)?.to_string(), v)
         }
     }
 }
@@ -229,8 +232,8 @@ where
 /// rt.block_on(async {
 ///     let node = Node::Step {
 ///         ref_: "up".into(),
-///         in_: Expr::Path { at: "$.input".into() },
-///         out: Expr::Path { at: "$.output".into() },
+///         in_: Expr::Path { at: "$.input".parse().unwrap() },
+///         out: Expr::Path { at: "$.output".parse().unwrap() },
 ///     };
 ///     let out = eval_async(&node, json!({ "input": "hello" }), &Fixture).await.unwrap();
 ///     assert_eq!(out, json!({ "input": "hello", "output": "HELLO" }));
@@ -258,10 +261,11 @@ where
     Ok(storage.snapshot())
 }
 
-/// Resolve `Path` Expr to its literal `$.a.b.c` string (async eval 側 helper).
-fn path_str_async(expr: &Expr) -> Result<&str, EvalError> {
+/// Extract the already-parsed [`Path`] out of a `Path` `Expr` (async eval
+/// side helper — mirrors `flow_ir_core`'s private `path_of`).
+fn path_of_async(expr: &Expr) -> Result<&Path, EvalError> {
     match expr {
-        Expr::Path { at } => Ok(at.as_str()),
+        Expr::Path { at } => Ok(at),
         _ => Err(EvalError::InvalidPath(
             "expected Path expr for write target".into(),
         )),
@@ -293,8 +297,8 @@ where
     let items_arr = match items_val {
         Value::Array(a) => a,
         other => {
-            return Err(EvalError::DispatcherError {
-                ref_: "fanout.items".into(),
+            return Err(EvalError::TypeError {
+                op: "fanout.items".into(),
                 msg: format!("expected array, got {other:?}"),
             })
         }
@@ -323,31 +327,41 @@ where
             Value::Array(branches.iter().map(|b| b.snapshot()).collect())
         }
         JoinMode::Any => {
+            // Promise.any parity (mirrors the sync side): zero items can
+            // never produce a winner, so this raises rather than returning
+            // `[]` (unlike All/AllSettled, whose empty-array result shape
+            // is still meaningful).
             if branch_futs.is_empty() {
-                Value::Array(vec![])
-            } else {
-                let mapped: Vec<_> = branch_futs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, f)| f.map(move |r| r.map(|()| i)).boxed())
-                    .collect();
-                let (winner_idx, _rest) = select_ok(mapped).await?;
-                branches[winner_idx].snapshot()
+                return Err(EvalError::TypeError {
+                    op: "fanout.any".into(),
+                    msg: "requires at least one item".into(),
+                });
             }
+            let mapped: Vec<_> = branch_futs
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| f.map(move |r| r.map(|()| i)).boxed())
+                .collect();
+            let (winner_idx, _rest) = select_ok(mapped).await?;
+            branches[winner_idx].snapshot()
         }
         JoinMode::Race => {
+            // Same rationale as Any: zero branches means there is nothing
+            // to race.
             if branch_futs.is_empty() {
-                Value::Array(vec![])
-            } else {
-                let mapped: Vec<_> = branch_futs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, f)| f.map(move |r| r.map(|()| i)).boxed())
-                    .collect();
-                let (first, _idx, _rest) = futures::future::select_all(mapped).await;
-                let winner_idx = first?;
-                branches[winner_idx].snapshot()
+                return Err(EvalError::TypeError {
+                    op: "fanout.race".into(),
+                    msg: "requires at least one item".into(),
+                });
             }
+            let mapped: Vec<_> = branch_futs
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| f.map(move |r| r.map(|()| i)).boxed())
+                .collect();
+            let (first, _idx, _rest) = futures::future::select_all(mapped).await;
+            let winner_idx = first?;
+            branches[winner_idx].snapshot()
         }
         JoinMode::AllSettled => {
             let results = join_all(branch_futs).await;
@@ -363,7 +377,7 @@ where
         }
     };
 
-    ctx.write(path_str_async(out)?, joined)
+    ctx.write(&path_of_async(out)?.to_string(), joined)
 }
 
 // ══════════════════════════════════════════════════════════════════════════

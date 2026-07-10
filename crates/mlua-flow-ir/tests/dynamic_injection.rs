@@ -94,19 +94,19 @@ async fn external_task_injects_state_during_step_await() {
             Node::Step {
                 ref_: "wait_for_signal".into(),
                 in_: Expr::Path {
-                    at: "$.seed".into(),
+                    at: "$.seed".parse().unwrap(),
                 },
                 out: Expr::Path {
-                    at: "$.signal_received".into(),
+                    at: "$.signal_received".parse().unwrap(),
                 },
             },
             Node::Step {
                 ref_: "echo".into(),
                 in_: Expr::Path {
-                    at: "$.injected".into(),
+                    at: "$.injected".parse().unwrap(),
                 },
                 out: Expr::Path {
-                    at: "$.echoed".into(),
+                    at: "$.echoed".parse().unwrap(),
                 },
             },
         ],
@@ -170,10 +170,10 @@ async fn external_task_constructs_expr_at_runtime_and_writes() {
     let flow = Node::Step {
         ref_: "wait_for_signal".into(),
         in_: Expr::Path {
-            at: "$.base".into(),
+            at: "$.base".parse().unwrap(),
         },
         out: Expr::Path {
-            at: "$.done".into(),
+            at: "$.done".parse().unwrap(),
         },
     };
 
@@ -183,7 +183,7 @@ async fn external_task_constructs_expr_at_runtime_and_writes() {
 
         // **runtime に Expr tree を構築** (= IR には書かれていない、 動的注入)
         let dynamic_expr = Expr::Path {
-            at: "$.base".into(),
+            at: "$.base".parse().unwrap(),
         };
         let snap = storage_for_external.snapshot();
         let resolved = eval_expr(&dynamic_expr, &snap).expect("runtime eval_expr failed");
@@ -224,13 +224,19 @@ async fn assign_node_writes_value_inline() {
     let flow = Node::Seq {
         children: vec![
             Node::Assign {
-                at: Expr::Path { at: "$.y".into() },
+                at: Expr::Path {
+                    at: "$.y".parse().unwrap(),
+                },
                 value: Expr::Lit { value: json!(42) },
             },
             Node::Step {
                 ref_: "echo".into(),
-                in_: Expr::Path { at: "$.y".into() },
-                out: Expr::Path { at: "$.z".into() },
+                in_: Expr::Path {
+                    at: "$.y".parse().unwrap(),
+                },
+                out: Expr::Path {
+                    at: "$.z".parse().unwrap(),
+                },
             },
         ],
     };

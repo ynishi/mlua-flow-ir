@@ -5,7 +5,9 @@
 //! Node kinds (Step / Seq / Branch / Fanout / Loop / Try / Assign) + Expr ops
 //! (canonical wire format — comparison / boolean / existence / arithmetic /
 //! aggregate / `call_extern`) + sync `eval` + `Dispatcher` trait + `Externs`
-//! registry + Path read/write.
+//! registry + typed [`Path`] read/write (see [`Path`] for the full path
+//! syntax + uniform malformed-path rejection rules — the single authority,
+//! rather than restating them here).
 //!
 //! mlua / futures / async 依存ゼロ。 async runtime + mlua binding は上流
 //! `mlua-flow-ir` crate が担当する 4 層 stack の core 層。
@@ -41,6 +43,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+mod path;
+pub use path::{Path, PathParseError};
 
 // ──────────────────────────────────────────────────────────────────────────
 // IR: 7 Node kinds + 20 Expr ops
@@ -173,8 +178,9 @@ pub enum JoinMode {
 pub enum Expr {
     /// `Path` — read a value from ctx by simple `$.a.b.c` form.
     Path {
-        /// The `$.a.b.c` (or bracket-notation) path string — see [`read_path`].
-        at: String,
+        /// The parsed context path — see [`Path`] for syntax + rejection
+        /// rules. Deserialized (and syntax-validated) once, at parse time.
+        at: Path,
     },
     /// `Lit` — literal JSON value.
     Lit {
@@ -271,7 +277,7 @@ pub enum Expr {
         /// Right-hand operand.
         rhs: Box<Expr>,
     },
-    /// `Div` — numeric `lhs / rhs`. Division by zero raises `DispatcherError`.
+    /// `Div` — numeric `lhs / rhs`. Division by zero raises `ArithError`.
     Div {
         /// Left-hand operand (dividend).
         lhs: Box<Expr>,
@@ -279,7 +285,7 @@ pub enum Expr {
         rhs: Box<Expr>,
     },
     /// `Mod` — numeric `lhs % rhs` (Lua `%` semantics: result takes the sign
-    /// of `rhs`). Modulo by zero raises `DispatcherError`.
+    /// of `rhs`). Modulo by zero raises `ArithError`.
     Mod {
         /// Left-hand operand (dividend).
         lhs: Box<Expr>,
@@ -287,7 +293,7 @@ pub enum Expr {
         rhs: Box<Expr>,
     },
     /// `Len` — length of `arg`: array → element count, string → char count,
-    /// object → key count. Other types raise `DispatcherError`.
+    /// object → key count. Other types raise `TypeError`.
     Len {
         /// Operand whose length is computed.
         arg: Box<Expr>,
@@ -341,22 +347,48 @@ where
 }
 
 /// Evaluation error.
+///
+/// `#[non_exhaustive]`: new variants may be added in a minor release: match
+/// with a wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EvalError {
     /// A `Path` read did not resolve — the requested key is missing from ctx.
     #[error("path not found: {0}")]
     PathNotFound(String),
-    /// A `Path` string is malformed (missing `$`/`$.` prefix, unterminated
-    /// bracket segment, etc. — see [`read_path`] / [`write_path`] docs).
+    /// A `Path` string is malformed — see [`Path`] for the full syntax +
+    /// rejection rules. Raised by the `read_path` / `write_path` compat
+    /// wrappers when their `&str` argument fails to parse; never raised by
+    /// [`Path::read`] / [`Path::write`] themselves (an already-parsed
+    /// `Path` cannot represent malformed syntax).
     #[error("invalid path syntax: {0}")]
     InvalidPath(String),
     /// `Branch.cond` evaluated to a non-boolean value.
     #[error("branch cond must be boolean, got: {0}")]
     NonBoolCond(Value),
+    /// An expression or node received a value of the wrong type (e.g. a
+    /// `Len`/`In`/comparison/arithmetic operand of the wrong JSON type, or a
+    /// `Fanout.items` result that did not evaluate to an array).
+    #[error("type error in '{op}': {msg}")]
+    TypeError {
+        /// The op (or synthetic label, e.g. `"fanout.any"`) that raised.
+        op: String,
+        /// Human-readable description of the type mismatch.
+        msg: String,
+    },
+    /// An arithmetic operation failed (division/modulo by zero, or a
+    /// numeric result/operand that cannot be represented as `f64`).
+    #[error("arithmetic error in '{op}': {msg}")]
+    ArithError {
+        /// The op (e.g. `"div"`, `"mod"`, `"cmp"`) that raised.
+        op: String,
+        /// Human-readable description of the arithmetic failure.
+        msg: String,
+    },
     /// The [`Dispatcher`] returned an error for the given `Step.ref`.
     #[error("dispatcher error for ref '{ref_}': {msg}")]
     DispatcherError {
-        /// The `Step.ref` (or synthetic op label) that raised.
+        /// The `Step.ref` that raised.
         ref_: String,
         /// The dispatcher's error message.
         msg: String,
@@ -519,17 +551,11 @@ impl CtxStorage for MemoryCtx {
     }
 
     fn write(&self, path: &str, value: Value) -> Result<(), EvalError> {
+        let parsed: Path = path
+            .parse()
+            .map_err(|e: PathParseError| EvalError::InvalidPath(e.to_string()))?;
         let mut guard = self.inner.lock().expect("ctx mutex poisoned");
-        let cur = std::mem::take(&mut *guard);
-        let updated = write_path(
-            &Expr::Path {
-                at: path.to_string(),
-            },
-            cur,
-            value,
-        )?;
-        *guard = updated;
-        Ok(())
+        parsed.write(&mut guard, value)
     }
 
     fn snapshot(&self) -> Value {
@@ -543,10 +569,13 @@ impl CtxStorage for MemoryCtx {
     }
 }
 
-/// Resolve `Path` Expr to its literal `$.a.b.c` string, or `InvalidPath` error.
-fn path_str(expr: &Expr) -> Result<&str, EvalError> {
+/// Extract the already-parsed [`Path`] out of a `Path` `Expr`, or
+/// `InvalidPath` if `expr` is some other `Expr` variant. No parsing happens
+/// here — the `Path` was parsed once, at deserialize (or `Path::from_str`)
+/// time.
+fn path_of(expr: &Expr) -> Result<&Path, EvalError> {
     match expr {
-        Expr::Path { at } => Ok(at.as_str()),
+        Expr::Path { at } => Ok(at),
         _ => Err(EvalError::InvalidPath(
             "expected Path expr for write target".into(),
         )),
@@ -589,7 +618,7 @@ pub fn eval_with_storage_externs<D: Dispatcher>(
                         ref_: ref_.clone(),
                         msg: e.to_string(),
                     })?;
-            ctx.write(path_str(out)?, output)
+            ctx.write(&path_of(out)?.to_string(), output)
         }
         Node::Seq { children } => {
             for child in children {
@@ -619,15 +648,15 @@ pub fn eval_with_storage_externs<D: Dispatcher>(
             let items_arr = match items_val {
                 Value::Array(a) => a,
                 other => {
-                    return Err(EvalError::DispatcherError {
-                        ref_: "fanout.items".into(),
+                    return Err(EvalError::TypeError {
+                        op: "fanout.items".into(),
                         msg: format!("expected array, got {other:?}"),
                     })
                 }
             };
             let joined =
                 fanout_eval_sync(bind, body, *join, &snap, items_arr, dispatcher, externs)?;
-            ctx.write(path_str(out)?, joined)
+            ctx.write(&path_of(out)?.to_string(), joined)
         }
         Node::Loop {
             counter,
@@ -635,8 +664,8 @@ pub fn eval_with_storage_externs<D: Dispatcher>(
             body,
             max,
         } => {
-            let counter_path = path_str(counter)?;
-            ctx.write(counter_path, Value::Number(serde_json::Number::from(0u32)))?;
+            let counter_path = path_of(counter)?.to_string();
+            ctx.write(&counter_path, Value::Number(serde_json::Number::from(0u32)))?;
             let mut n: u32 = 0;
             loop {
                 if n >= *max {
@@ -648,7 +677,7 @@ pub fn eval_with_storage_externs<D: Dispatcher>(
                 }
                 eval_with_storage_externs(body, ctx, dispatcher, externs)?;
                 n += 1;
-                ctx.write(counter_path, Value::Number(serde_json::Number::from(n)))?;
+                ctx.write(&counter_path, Value::Number(serde_json::Number::from(n)))?;
             }
             Ok(())
         }
@@ -665,7 +694,7 @@ pub fn eval_with_storage_externs<D: Dispatcher>(
                     // body の途中 write を破棄 (Try semantic: rollback)
                     ctx.replace(snap_before);
                     if let Some(at) = err_at {
-                        ctx.write(path_str(at)?, Value::String(e.to_string()))?;
+                        ctx.write(&path_of(at)?.to_string(), Value::String(e.to_string()))?;
                     }
                     eval_with_storage_externs(catch, ctx, dispatcher, externs)
                 }
@@ -674,7 +703,7 @@ pub fn eval_with_storage_externs<D: Dispatcher>(
         Node::Assign { at, value } => {
             let snap = ctx.snapshot();
             let v = eval_expr_with_externs(value, &snap, externs)?;
-            ctx.write(path_str(at)?, v)
+            ctx.write(&path_of(at)?.to_string(), v)
         }
     }
 }
@@ -701,6 +730,15 @@ fn fanout_eval_sync<D: Dispatcher>(
             Ok(Value::Array(results))
         }
         JoinMode::Any => {
+            // Promise.any parity: zero items can never produce a winner, so
+            // (unlike All/AllSettled, whose empty-array result shape is
+            // still meaningful) this raises rather than returning `[]`.
+            if items_arr.is_empty() {
+                return Err(EvalError::TypeError {
+                    op: "fanout.any".into(),
+                    msg: "requires at least one item".into(),
+                });
+            }
             let mut winner: Option<Value> = None;
             let mut last_err: Option<EvalError> = None;
             for item in items_arr {
@@ -718,17 +756,21 @@ fn fanout_eval_sync<D: Dispatcher>(
             if let Some(e) = last_err {
                 return Err(e);
             }
-            Ok(winner.unwrap_or(Value::Array(vec![])))
+            Ok(winner.expect("non-empty items_arr always assigns a winner or returns an error"))
         }
         JoinMode::Race => {
-            if let Some(first) = items_arr.into_iter().next() {
-                let branch_ctx = write_path(bind, base_snap.clone(), first)?;
-                let storage = MemoryCtx::new(branch_ctx);
-                eval_with_storage_externs(body, &storage, dispatcher, externs)?;
-                Ok(storage.snapshot())
-            } else {
-                Ok(Value::Array(vec![]))
-            }
+            // Same rationale as Any: zero branches means there is nothing to
+            // race, so this raises rather than returning `[]`.
+            let Some(first) = items_arr.into_iter().next() else {
+                return Err(EvalError::TypeError {
+                    op: "fanout.race".into(),
+                    msg: "requires at least one item".into(),
+                });
+            };
+            let branch_ctx = write_path(bind, base_snap.clone(), first)?;
+            let storage = MemoryCtx::new(branch_ctx);
+            eval_with_storage_externs(body, &storage, dispatcher, externs)?;
+            Ok(storage.snapshot())
         }
         JoinMode::AllSettled => {
             let mut records = Vec::with_capacity(items_arr.len());
@@ -798,7 +840,8 @@ pub fn eval_expr_with_externs(
     let ev = |e: &Expr| eval_expr_with_externs(e, ctx, externs);
     match expr {
         Expr::Lit { value } => Ok(value.clone()),
-        Expr::Path { at } => read_path(at, ctx),
+        // `at` is an already-parsed `Path` — no re-parse in this hot path.
+        Expr::Path { at } => at.read(ctx).cloned(),
         Expr::Eq { lhs, rhs } => Ok(Value::Bool(json_eq(&ev(lhs)?, &ev(rhs)?))),
         Expr::Ne { lhs, rhs } => Ok(Value::Bool(!json_eq(&ev(lhs)?, &ev(rhs)?))),
         Expr::Lt { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_lt()),
@@ -854,8 +897,8 @@ pub fn eval_expr_with_externs(
                 Value::String(s) => s.chars().count(),
                 Value::Object(o) => o.len(),
                 other => {
-                    return Err(EvalError::DispatcherError {
-                        ref_: "expr.len".into(),
+                    return Err(EvalError::TypeError {
+                        op: "expr.len".into(),
                         msg: format!("len: unsupported type {other:?}"),
                     })
                 }
@@ -867,8 +910,8 @@ pub fn eval_expr_with_externs(
             let h = ev(haystack)?;
             match h {
                 Value::Array(a) => Ok(Value::Bool(a.iter().any(|e| json_eq(e, &n)))),
-                other => Err(EvalError::DispatcherError {
-                    ref_: "expr.in".into(),
+                other => Err(EvalError::TypeError {
+                    op: "expr.in".into(),
                     msg: format!("in: haystack must be array, got {other:?}"),
                 }),
             }
@@ -907,15 +950,18 @@ fn json_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Coerce a JSON value to f64 for numeric ops. Bool / null / non-number raise.
+/// Coerce a JSON value to f64 for numeric ops. A non-`Number` value is a
+/// `TypeError` (wrong JSON type); a `Number` that itself cannot be
+/// represented as `f64` (e.g. an integer beyond `f64`'s exact range) is an
+/// `ArithError` (right type, unrepresentable value).
 fn to_f64(v: &Value, op: &str) -> Result<f64, EvalError> {
     match v {
-        Value::Number(n) => n.as_f64().ok_or_else(|| EvalError::DispatcherError {
-            ref_: format!("expr.{op}"),
+        Value::Number(n) => n.as_f64().ok_or_else(|| EvalError::ArithError {
+            op: op.into(),
             msg: format!("non-f64-representable number: {n}"),
         }),
-        other => Err(EvalError::DispatcherError {
-            ref_: format!("expr.{op}"),
+        other => Err(EvalError::TypeError {
+            op: op.into(),
             msg: format!("expected number, got {other:?}"),
         }),
     }
@@ -933,16 +979,15 @@ where
         (Value::Number(_), Value::Number(_)) => {
             let l = to_f64(lv, "cmp")?;
             let r = to_f64(rv, "cmp")?;
-            l.partial_cmp(&r)
-                .ok_or_else(|| EvalError::DispatcherError {
-                    ref_: "expr.cmp".into(),
-                    msg: "non-comparable numbers (NaN)".into(),
-                })?
+            l.partial_cmp(&r).ok_or_else(|| EvalError::ArithError {
+                op: "cmp".into(),
+                msg: "non-comparable numbers (NaN)".into(),
+            })?
         }
         (Value::String(l), Value::String(r)) => l.cmp(r),
         (l, r) => {
-            return Err(EvalError::DispatcherError {
-                ref_: "expr.cmp".into(),
+            return Err(EvalError::TypeError {
+                op: "cmp".into(),
                 msg: format!("cmp: both sides must be numbers or strings, got {l:?} vs {r:?}"),
             })
         }
@@ -956,204 +1001,45 @@ where
 {
     let l = to_f64(lv, op)?;
     let r = to_f64(rv, op)?;
-    let result = f(l, r).ok_or_else(|| EvalError::DispatcherError {
-        ref_: format!("expr.{op}"),
+    let result = f(l, r).ok_or_else(|| EvalError::ArithError {
+        op: op.into(),
         msg: "arithmetic failure (e.g. division by zero)".into(),
     })?;
-    let n = serde_json::Number::from_f64(result).ok_or_else(|| EvalError::DispatcherError {
-        ref_: format!("expr.{op}"),
+    let n = serde_json::Number::from_f64(result).ok_or_else(|| EvalError::ArithError {
+        op: op.into(),
         msg: format!("result not f64-representable: {result}"),
     })?;
     Ok(Value::Number(n))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Path helpers — `$.a.b.c` dot form, plus RFC 9535 (JSONPath) style bracket
-// notation (`$.a["p.md"]`, `$["x.y"]`) for keys that contain a literal dot.
-// No array index support (MVP scope).
+// Path compat wrappers — thin `&str` entry points over the typed `Path` in
+// `path.rs`, which is the single authority for path syntax + rejection
+// rules. See [`Path`] docs for the full syntax (dot form, RFC 9535-style
+// bracket notation, uniform malformed-path rejections).
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Read a path from a JSON value.
+/// Parse `path` and read the value it resolves to inside `ctx`.
 ///
-/// Supports the simple dot form `$.a.b.c`, plus RFC 9535-style bracket
-/// notation for object keys that contain a literal `.`: `$.a["p.md"]` reads
-/// `ctx.a["p.md"]`, and `$["x.y"]` reads `ctx["x.y"]`. Bracket segments may
-/// be chained directly (`$.a["x"]["y"]`) or followed by a dot segment
-/// (`$["x.y"].inner`). Bracket keys support no escaping — a literal `"` in
-/// a key cannot be represented.
-///
-/// Paths without `[` take the original dot-split code path unchanged
-/// (no behavioural change for existing callers).
+/// Thin wrapper: parses `path` via [`str::parse`] (surfacing a parse
+/// failure as [`EvalError::InvalidPath`]) then delegates to [`Path::read`].
+/// Callers holding an already-parsed `Path` (e.g. from an `Expr::Path`)
+/// should call [`Path::read`] directly to avoid re-parsing.
 pub fn read_path(path: &str, ctx: &Value) -> Result<Value, EvalError> {
-    let trimmed = strip_path_prefix(path)?;
-    if trimmed.is_empty() {
-        return Ok(ctx.clone());
-    }
-    let mut cur = ctx;
-    if trimmed.contains('[') {
-        let segments = parse_path_segments(trimmed)?;
-        for key in &segments {
-            cur = cur
-                .get(key.as_str())
-                .ok_or_else(|| EvalError::PathNotFound(path.to_string()))?;
-        }
-    } else {
-        for key in trimmed.split('.') {
-            cur = cur
-                .get(key)
-                .ok_or_else(|| EvalError::PathNotFound(path.to_string()))?;
-        }
-    }
-    Ok(cur.clone())
+    let parsed: Path = path
+        .parse()
+        .map_err(|e: PathParseError| EvalError::InvalidPath(e.to_string()))?;
+    parsed.read(ctx).cloned()
 }
 
 /// Write a value at the path location inside ctx, returning the updated ctx.
-/// `out` must be a `Path` Expr.
-///
-/// Accepts the same dot form and RFC 9535-style bracket notation as
-/// [`read_path`] (see its docs for syntax + examples). Intermediate objects
-/// along the path are created automatically, mirroring the existing
-/// dot-form behaviour.
+/// `out` must be a `Path` Expr (its `at` field is an already-parsed `Path`,
+/// so no re-parsing happens here — this is a thin wrapper around
+/// [`Path::write`], adapted to the `Value`-in/`Value`-out shape the rest of
+/// this crate's legacy (non-`CtxStorage`) API uses).
 pub fn write_path(out: &Expr, ctx: Value, value: Value) -> Result<Value, EvalError> {
-    let path = match out {
-        Expr::Path { at } => at,
-        _ => {
-            return Err(EvalError::InvalidPath(
-                "Step.out must be a Path expr".into(),
-            ))
-        }
-    };
-    let trimmed = strip_path_prefix(path)?;
-    let keys: Vec<String> = if trimmed.contains('[') {
-        parse_path_segments(trimmed)?
-    } else {
-        trimmed
-            .split('.')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
-    };
-    if keys.is_empty() {
-        return Ok(value);
-    }
+    let path = path_of(out)?;
     let mut root = ctx;
-    write_path_recursive(&mut root, &keys, value);
+    path.write(&mut root, value)?;
     Ok(root)
-}
-
-fn strip_path_prefix(path: &str) -> Result<&str, EvalError> {
-    path.strip_prefix("$.")
-        .or_else(|| path.strip_prefix('$'))
-        .ok_or_else(|| EvalError::InvalidPath(format!("path must start with $ or $.: {}", path)))
-}
-
-/// Parse a (prefix-stripped, non-empty) path string containing at least one
-/// `[` into its object-key segments. Supports:
-///
-/// - plain segment: any run of chars excluding `.` and `[`, non-empty.
-/// - bracket segment: `["<name>"]`, where `<name>` is one or more chars
-///   excluding `"` (no escape support — a key containing `"` is rejected).
-/// - plain segments are `.`-separated; a bracket segment may follow
-///   directly after the previous segment (`a["x"]`) or after a `.`
-///   (`a.["x"]`), and a bracket segment may itself be followed directly by
-///   another bracket (`a["x"]["y"]`) or by a `.` before the next plain
-///   segment (`a["x"].b`).
-///
-/// Any malformed sequence (unterminated bracket, missing quote, empty key,
-/// empty segment, bracket directly followed by an unseparated plain
-/// segment, ...) raises `EvalError::InvalidPath` — this parser never
-/// silently misparses.
-fn parse_path_segments(trimmed: &str) -> Result<Vec<String>, EvalError> {
-    fn invalid(trimmed: &str, reason: &str) -> EvalError {
-        EvalError::InvalidPath(format!("{reason}: {trimmed}"))
-    }
-
-    let bytes = trimmed.as_bytes();
-    let len = bytes.len();
-    let mut segments = Vec::new();
-    let mut i = 0usize;
-    // true at path start and immediately after a `.`: the next byte must
-    // begin a new segment (plain or bracket), not another `.` or EOF.
-    let mut expect_segment_start = true;
-
-    while i < len {
-        match bytes[i] {
-            b'[' => {
-                if i + 1 >= len || bytes[i + 1] != b'"' {
-                    return Err(invalid(trimmed, "expected '\"' after '['"));
-                }
-                let name_start = i + 2;
-                let mut j = name_start;
-                while j < len && bytes[j] != b'"' {
-                    j += 1;
-                }
-                if j >= len {
-                    return Err(invalid(trimmed, "unterminated bracket segment"));
-                }
-                let name = &trimmed[name_start..j];
-                if name.is_empty() {
-                    return Err(invalid(trimmed, "empty bracket key"));
-                }
-                if j + 1 >= len || bytes[j + 1] != b']' {
-                    return Err(invalid(trimmed, "missing closing ']' after key"));
-                }
-                segments.push(name.to_string());
-                i = j + 2;
-                expect_segment_start = false;
-                // Only `.` or another `[` (or EOF) may directly follow a
-                // bracket segment — a bare plain-segment continuation
-                // (`a["x"]b`) is ambiguous and rejected.
-                if i < len && bytes[i] != b'.' && bytes[i] != b'[' {
-                    return Err(invalid(
-                        trimmed,
-                        "expected '.' or '[' after bracket segment",
-                    ));
-                }
-            }
-            b'.' => {
-                if expect_segment_start {
-                    return Err(invalid(trimmed, "empty path segment"));
-                }
-                i += 1;
-                expect_segment_start = true;
-                if i >= len {
-                    return Err(invalid(trimmed, "empty path segment"));
-                }
-            }
-            _ => {
-                let start = i;
-                while i < len && bytes[i] != b'.' && bytes[i] != b'[' {
-                    i += 1;
-                }
-                segments.push(trimmed[start..i].to_string());
-                expect_segment_start = false;
-            }
-        }
-    }
-
-    if expect_segment_start {
-        return Err(invalid(trimmed, "empty path segment"));
-    }
-
-    Ok(segments)
-}
-
-fn write_path_recursive(node: &mut Value, keys: &[String], value: Value) {
-    if keys.is_empty() {
-        *node = value;
-        return;
-    }
-    if !node.is_object() {
-        *node = Value::Object(serde_json::Map::new());
-    }
-    let obj = node.as_object_mut().expect("just initialised as object");
-    let key = &keys[0];
-    if keys.len() == 1 {
-        obj.insert(key.clone(), value);
-    } else {
-        let entry = obj
-            .entry(key.clone())
-            .or_insert(Value::Object(serde_json::Map::new()));
-        write_path_recursive(entry, &keys[1..], value);
-    }
 }

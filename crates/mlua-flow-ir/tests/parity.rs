@@ -267,9 +267,10 @@ fn build_corpus() -> Vec<Case> {
                 "results": [{"item": "A"}, {"item": "B"}, {"item": "C"}],
             }))),
         },
-        // 7b-e. Fanout — empty items, every JoinMode (same empty shape both
-        // sides — verified by code reading: All/Any/Race/AllSettled all
-        // short-circuit to an empty `Ok` result when `items` is `[]`).
+        // 7b-e. Fanout — empty items, every JoinMode. All/AllSettled keep
+        // their empty-array-is-a-meaningful-result shape; Any/Race now
+        // raise (Promise.any/Promise.race parity — zero items can never
+        // produce a winner) on both sides.
         Case {
             name: "fanout_empty_items_all",
             node: node_from(fanout_wire("all", json!([]))),
@@ -280,13 +281,13 @@ fn build_corpus() -> Vec<Case> {
             name: "fanout_empty_items_any",
             node: node_from(fanout_wire("any", json!([]))),
             ctx: json!({}),
-            expect: Expect::Ok(Some(json!({"results": []}))),
+            expect: Expect::Err,
         },
         Case {
             name: "fanout_empty_items_race",
             node: node_from(fanout_wire("race", json!([]))),
             ctx: json!({}),
-            expect: Expect::Ok(Some(json!({"results": []}))),
+            expect: Expect::Err,
         },
         Case {
             name: "fanout_empty_items_all_settled",

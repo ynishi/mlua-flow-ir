@@ -220,31 +220,33 @@ fn fanout_empty_items_shapes() {
     .unwrap();
     assert_eq!(settled_out["results"], json!([]));
 
-    // NOTE: Any / Race normally resolve to a *single ctx object* on success
-    // (see fanout_any_mode_success_shape_is_single_winner_ctx /
-    // fanout_race_mode_success_shape_is_first_item_ctx_only above). With an
-    // empty `items` array there is no branch to produce that object, so the
-    // implementation falls back to `Value::Array(vec![])` — an empty
-    // *array*, a different shape family than the non-empty "winner ctx
-    // object" case. This is an existing shape inconsistency in
-    // `fanout_eval_sync`'s Any/Race arms; asserting the actual observed
-    // behavior here, not proposing a fix (src is out of scope for this
-    // test-only pass).
-    let any_out = eval(
+    // Any / Race: zero items can never produce a winner (Promise.any /
+    // Promise.race parity) — both now raise `TypeError` instead of falling
+    // back to an empty array (the previous behavior was an inconsistent
+    // shape: Any/Race normally resolve to a *single ctx object* on success,
+    // and silently returning `[]` on the empty-items edge case mixed shape
+    // families).
+    let any_err = eval(
         &fanout_node("any", json!([])),
         json!({}),
         &FxDispatcher::new(),
     )
-    .unwrap();
-    assert_eq!(any_out["results"], json!([]));
+    .unwrap_err();
+    assert!(
+        matches!(any_err, EvalError::TypeError { ref op, .. } if op == "fanout.any"),
+        "{any_err:?}"
+    );
 
-    let race_out = eval(
+    let race_err = eval(
         &fanout_node("race", json!([])),
         json!({}),
         &FxDispatcher::new(),
     )
-    .unwrap();
-    assert_eq!(race_out["results"], json!([]));
+    .unwrap_err();
+    assert!(
+        matches!(race_err, EvalError::TypeError { ref op, .. } if op == "fanout.race"),
+        "{race_err:?}"
+    );
 }
 
 #[test]
@@ -256,7 +258,7 @@ fn fanout_non_array_items_errors() {
     );
     let err = eval(&node, json!({}), &FxDispatcher::new()).unwrap_err();
     assert!(
-        matches!(err, EvalError::DispatcherError { ref ref_, .. } if ref_ == "fanout.items"),
+        matches!(err, EvalError::TypeError { ref op, .. } if op == "fanout.items"),
         "{err:?}"
     );
 }

@@ -12,7 +12,9 @@ fn lit(v: serde_json::Value) -> Box<Expr> {
 }
 
 fn path(at: &str) -> Box<Expr> {
-    Box::new(Expr::Path { at: at.into() })
+    Box::new(Expr::Path {
+        at: at.parse().unwrap(),
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -624,7 +626,9 @@ fn call_extern_resolves_registered_fn() {
                     value: json!(std::f64::consts::E.powi(4)),
                 }],
             }),
-            rhs: Box::new(Expr::Path { at: "$.n".into() }),
+            rhs: Box::new(Expr::Path {
+                at: "$.n".parse().unwrap(),
+            }),
         }],
     };
     let out = eval_expr_with_externs(&e, &ctx, &externs).unwrap();
@@ -727,7 +731,9 @@ fn parse_canonical_gte_lte_mod_call_extern() {
 // ──────────────────────────────────────────────────────────────────────────
 
 fn path_expr(at: &str) -> Expr {
-    Expr::Path { at: at.into() }
+    Expr::Path {
+        at: at.parse().unwrap(),
+    }
 }
 
 #[test]
