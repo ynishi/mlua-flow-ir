@@ -1,3 +1,5 @@
+#![cfg(feature = "mlua")]
+
 use mlua::Lua;
 use mlua_flow_ir::module;
 

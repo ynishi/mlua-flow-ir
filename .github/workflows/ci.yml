@@ -32,6 +32,9 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      - name: Check async-only build (no mlua)
+        run: cargo check -p mlua-flow-ir --no-default-features --all-targets
+
       - name: cargo doc (missing_docs gate)
         run: cargo doc --workspace --no-deps
         env:

@@ -63,6 +63,19 @@ impl AsyncDispatcher for AsyncFixture {
 }
 ```
 
+## Feature flags
+
+| Feature | Default | Meaning |
+|---|---|---|
+| `lua51` / `lua52` / `lua53` / `lua54` / `luajit` / `luau` | `lua54` on | Lua version selection, forwarded to `mlua`. Exactly one must be enabled when the Lua binding (`module()`) is used — `mlua` itself enforces this. |
+| `vendored` | on | Links a bundled Lua built from source instead of a system Lua. |
+
+Default = `lua54` + `vendored`, matching every existing consumer.
+
+- **Different Lua version**: `default-features = false, features = ["luajit", "vendored"]`
+- **System Lua instead of vendored**: drop `vendored` from the feature list
+- **Async-only, no Lua binding**: `default-features = false` — `mlua` is not compiled in and `module()` is unavailable
+
 ## License
 
 MIT OR Apache-2.0

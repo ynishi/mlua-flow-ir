@@ -32,6 +32,16 @@
 //! dispatch once one succeeds); async launches every branch concurrently and
 //! cancels the losers at their next `.await` point, so in-flight side
 //! effects on losing branches may be truncated.
+//!
+//! ## Feature flags
+//!
+//! Default = `lua54` + `vendored` (matches every existing consumer). The
+//! Lua `module()` binding and its `mlua` dependency live behind the
+//! implicit `mlua` feature (auto-enabled by any `lua5x`/`luajit`/`luau`
+//! feature). To pick another Lua version: `default-features = false,
+//! features = ["luajit", "vendored"]`. To link a system Lua instead of a
+//! vendored build, drop `vendored`. For an async-only build with no Lua
+//! binding at all (`module()` unavailable): `default-features = false`.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Re-export Pure Rust core (flow-ir-core)
@@ -357,9 +367,10 @@ where
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// v0.0.3 — mlua bridge full
+// v0.0.3 — mlua bridge full (feature = "mlua")
 // ══════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "mlua")]
 use mlua::LuaSerdeExt;
 
 /// Lua function を Rust `Dispatcher` trait に wrap した adapter。
@@ -367,11 +378,13 @@ use mlua::LuaSerdeExt;
 /// Lua 側 dispatcher function `function(ref, input) return ... end` を受けて、
 /// Rust `eval(node, ctx, &lua_dispatcher)` から呼び出せるようにする。
 /// 内部で serde Value ↔ Lua value 変換 (= mlua serde feature) を経由。
+#[cfg(feature = "mlua")]
 struct LuaDispatcher<'a> {
     lua: &'a mlua::Lua,
     func: mlua::Function,
 }
 
+#[cfg(feature = "mlua")]
 impl<'a> Dispatcher for LuaDispatcher<'a> {
     fn dispatch(&self, ref_: &str, input: Value) -> Result<Value, EvalError> {
         let lua_input = self
@@ -404,11 +417,13 @@ impl<'a> Dispatcher for LuaDispatcher<'a> {
 /// pure Lua function で、 `call_extern` Expr の ref で引かれ、 評価済み args
 /// を positional に受けて値を返す。 これが「LuaScript 直実行 Hatch」の
 /// Rust 側の受け口 (extern の実体は任意の Lua closure)。
+#[cfg(feature = "mlua")]
 struct LuaExterns<'a> {
     lua: &'a mlua::Lua,
     table: mlua::Table,
 }
 
+#[cfg(feature = "mlua")]
 impl<'a> flow_ir_core::Externs for LuaExterns<'a> {
     fn call(&self, ref_: &str, args: &[Value]) -> Result<Value, EvalError> {
         let func: mlua::Function = self.table.get(ref_).map_err(|_| EvalError::ExternError {
@@ -477,6 +492,7 @@ impl<'a> flow_ir_core::Externs for LuaExterns<'a> {
 ///                           { ["math.sqrt"] = math.sqrt })
 /// assert(result2.root == 3)
 /// ```
+#[cfg(feature = "mlua")]
 pub fn module(lua: &mlua::Lua) -> mlua::Result<mlua::Table> {
     let t = lua.create_table()?;
     t.set("version", env!("CARGO_PKG_VERSION"))?;
