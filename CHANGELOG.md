@@ -8,8 +8,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
-- Bracket notation for keys containing dots in `read_path` / `write_path`, RFC 9535 (JSONPath) style: `$.a["plan.md"]`, `$["x.y"]` (#1).
-
 ### Changed
 
 ### Deprecated
@@ -19,6 +17,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ### Fixed
 
 ### Security
+
+## [0.1.2] — 2026-07-10
+
+### Added
+
+- Bracket notation for keys containing dots in `read_path` / `write_path`, RFC 9535 (JSONPath) style: `$.a["plan.md"]`, `$["x.y"]` (#1).
 
 ## [0.1.1] — 2026-07-05
 
