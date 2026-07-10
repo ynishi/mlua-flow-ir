@@ -47,6 +47,165 @@ fn ne_op() {
 }
 
 #[test]
+fn eq_op() {
+    let ctx = json!({});
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!(1)),
+                rhs: lit(json!(1))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!(1)),
+                rhs: lit(json!(2))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(false)
+    );
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!("a")),
+                rhs: lit(json!("a"))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!(true)),
+                rhs: lit(json!(true))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!(null)),
+                rhs: lit(json!(null))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
+}
+
+#[test]
+fn eq_numeric_coercion_matches_arithmetic_result() {
+    // regression: `Add` always emits a float (serde_json::Number::from_f64),
+    // while a literal `5` is stored as an integer variant. Prior to the
+    // json_eq fix, `eq(add(2,3), lit(5))` was `false` because
+    // serde_json::Value's derived PartialEq distinguishes int vs float
+    // Number variants even when the values are numerically equal.
+    let ctx = json!({});
+    let e = Expr::Eq {
+        lhs: Box::new(Expr::Add {
+            lhs: lit(json!(2)),
+            rhs: lit(json!(3)),
+        }),
+        rhs: lit(json!(5)),
+    };
+    assert_eq!(eval_expr(&e, &ctx).unwrap(), json!(true));
+}
+
+#[test]
+fn eq_ne_int_float_parity() {
+    let ctx = json!({});
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!(5)),
+                rhs: lit(json!(5.0))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval_expr(
+            &Expr::Ne {
+                lhs: lit(json!(5)),
+                rhs: lit(json!(5.0))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(false)
+    );
+}
+
+#[test]
+fn eq_nested_array_object_numeric_coercion() {
+    let ctx = json!({});
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!([1, 2])),
+                rhs: lit(json!([1.0, 2.0]))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!({ "a": 1 })),
+                rhs: lit(json!({ "a": 1.0 }))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
+}
+
+#[test]
+fn eq_mixed_type_and_length_still_false() {
+    let ctx = json!({});
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!(1)),
+                rhs: lit(json!("1"))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(false)
+    );
+    assert_eq!(
+        eval_expr(
+            &Expr::Eq {
+                lhs: lit(json!([1])),
+                rhs: lit(json!([1, 2]))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(false)
+    );
+}
+
+#[test]
 fn lt_lte_gt_gte_ops() {
     let ctx = json!({});
     let e = Expr::Lt {
@@ -411,6 +570,24 @@ fn in_op() {
         &ctx
     )
     .is_err());
+}
+
+#[test]
+fn in_op_numeric_coercion() {
+    // membership uses json_eq, so an integer needle matches a float element
+    // (and vice versa), mirroring Eq's numeric coercion.
+    let ctx = json!({});
+    assert_eq!(
+        eval_expr(
+            &Expr::In {
+                needle: lit(json!(5)),
+                haystack: lit(json!([4.0, 5.0]))
+            },
+            &ctx
+        )
+        .unwrap(),
+        json!(true)
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────

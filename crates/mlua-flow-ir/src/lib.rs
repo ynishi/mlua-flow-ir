@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 //! flow.ir async runtime + mlua binding.
 //!
 //! Layer 3 of the 4-layer flow.ir stack:
@@ -6,7 +7,8 @@
 //! 1. `flow-ir-lua` — Pure Lua DSL (separate repo, ecosystem-neutral)
 //! 2. `flow-ir-core` — Pure Rust schema + sync interpreter (no mlua, no async)
 //! 3. `mlua-flow-ir` — **this crate**: re-export of `flow-ir-core` +
-//!    `AsyncDispatcher` + `eval_async` + `fanout_eval` + Lua `module()` binding
+//!    `AsyncDispatcher` + `eval_async` (including `Fanout` join-mode
+//!    support) + Lua `module()` binding
 //! 4. `mlua-swarm-engine` — host concerns (Spawner / Worker / Loop /
 //!    AuthzPolicy / cp_state persist)
 //!
@@ -17,6 +19,19 @@
 //! ```
 //! use mlua_flow_ir::{eval, eval_async, AsyncDispatcher, Dispatcher, EvalError, Expr, Node};
 //! ```
+//!
+//! ## Sync/async divergence (`Fanout` join modes)
+//!
+//! Sync (`flow_ir_core::eval_with_storage_externs`) and async
+//! (`eval_async_with_storage_externs`) share identical per-`Node` logic for
+//! `Step` / `Seq` / `Branch` / `Loop` / `Try` / `Assign`, and for
+//! `JoinMode::All`. Two `Fanout` modes are **intentionally** divergent:
+//! `Race` — sync evaluates only `items[0]`; async races every branch and the
+//! first branch to *complete* wins, so an early error can win over a later
+//! success. `Any` — sync short-circuits sequentially (later branches never
+//! dispatch once one succeeds); async launches every branch concurrently and
+//! cancels the losers at their next `.await` point, so in-flight side
+//! effects on losing branches may be truncated.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Re-export Pure Rust core (flow-ir-core)
@@ -45,46 +60,11 @@ use async_trait::async_trait;
 /// tokio dep 入れない (= Pure 維持)、 executor は caller (host) 責務。
 #[async_trait]
 pub trait AsyncDispatcher: Send + Sync {
+    /// Resolve `ref_` against `input` asynchronously, returning the step's
+    /// raw output value.
     async fn dispatch(&self, ref_: &str, input: Value) -> Result<Value, EvalError>;
 }
 
-/// Evaluate a `Node` against a context value asynchronously,
-/// using the given async dispatcher for `Step` resolution.
-///
-/// `eval` (sync) と同型 logic、 dispatch を `.await` に置き換え。 Seq / Branch
-/// は recursive async fn (= `async_recursion` macro で `Pin<Box>` wrap)。
-///
-/// # Quick start
-///
-/// ```
-/// use async_trait::async_trait;
-/// use mlua_flow_ir::{eval_async, AsyncDispatcher, EvalError, Expr, Node};
-/// use serde_json::{json, Value};
-///
-/// struct Fixture;
-///
-/// #[async_trait]
-/// impl AsyncDispatcher for Fixture {
-///     async fn dispatch(&self, _r: &str, input: Value) -> Result<Value, EvalError> {
-///         if let Value::String(s) = input {
-///             Ok(Value::String(s.to_uppercase()))
-///         } else {
-///             Ok(input)
-///         }
-///     }
-/// }
-///
-/// let rt = tokio::runtime::Runtime::new().unwrap();
-/// rt.block_on(async {
-///     let node = Node::Step {
-///         ref_: "up".into(),
-///         in_: Expr::Path { at: "$.input".into() },
-///         out: Expr::Path { at: "$.output".into() },
-///     };
-///     let out = eval_async(&node, json!({ "input": "hello" }), &Fixture).await.unwrap();
-///     assert_eq!(out, json!({ "input": "hello", "output": "HELLO" }));
-/// });
-/// ```
 /// Storage-backed async evaluator — canonical entry.
 ///
 /// `Arc<dyn CtxStorage>` 経由で ctx を共有することで、 dispatch().await suspend
@@ -205,9 +185,47 @@ where
     }
 }
 
+/// Evaluate a `Node` against a context value asynchronously, using the given
+/// async dispatcher for `Step` resolution.
+///
 /// Legacy Value-passing async evaluator — backward compat wrapper around
 /// `eval_async_with_storage` + `MemoryCtx`. 既存 caller (= dynamic injection
 /// を要求しない用途) は引き続きこの API で OK。
+///
+/// `eval` (sync) と同型 logic、 dispatch を `.await` に置き換え。 Seq / Branch
+/// は recursive async fn (= `async_recursion` macro で `Pin<Box>` wrap)。
+///
+/// # Quick start
+///
+/// ```
+/// use async_trait::async_trait;
+/// use mlua_flow_ir::{eval_async, AsyncDispatcher, EvalError, Expr, Node};
+/// use serde_json::{json, Value};
+///
+/// struct Fixture;
+///
+/// #[async_trait]
+/// impl AsyncDispatcher for Fixture {
+///     async fn dispatch(&self, _r: &str, input: Value) -> Result<Value, EvalError> {
+///         if let Value::String(s) = input {
+///             Ok(Value::String(s.to_uppercase()))
+///         } else {
+///             Ok(input)
+///         }
+///     }
+/// }
+///
+/// let rt = tokio::runtime::Runtime::new().unwrap();
+/// rt.block_on(async {
+///     let node = Node::Step {
+///         ref_: "up".into(),
+///         in_: Expr::Path { at: "$.input".into() },
+///         out: Expr::Path { at: "$.output".into() },
+///     };
+///     let out = eval_async(&node, json!({ "input": "hello" }), &Fixture).await.unwrap();
+///     assert_eq!(out, json!({ "input": "hello", "output": "HELLO" }));
+/// });
+/// ```
 pub async fn eval_async<D>(node: &Node, ctx: Value, dispatcher: &D) -> Result<Value, EvalError>
 where
     D: AsyncDispatcher + ?Sized,

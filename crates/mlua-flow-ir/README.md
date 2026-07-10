@@ -2,7 +2,7 @@
 
 flow.ir async runtime + mlua binding. Layer 3 of the 4-layer flow.ir stack.
 
-Re-exports the Pure Rust core ([`flow-ir-core`](https://crates.io/crates/flow-ir-core)) and adds `AsyncDispatcher` + `eval_async` + `fanout_eval` + Lua `module()` binding.
+Re-exports the Pure Rust core ([`flow-ir-core`](https://crates.io/crates/flow-ir-core)) and adds `AsyncDispatcher` + `eval_async` (including `Fanout` join-mode support) + Lua `module()` binding.
 
 ## Stack position
 
@@ -15,7 +15,7 @@ Re-exports the Pure Rust core ([`flow-ir-core`](https://crates.io/crates/flow-ir
 
 - All `flow-ir-core` schema types re-exported verbatim (`Node` / `Expr` / `Dispatcher` / `EvalError` / …)
 - `AsyncDispatcher` trait + `eval_async` for tokio / async-runtime hosts
-- `fanout_eval` for parallel `Step` dispatch
+- `Fanout` parallel `Step` dispatch (`All` / `Any` / `Race` / `AllSettled` join modes) via `eval_async`
 - `module(lua)` binding that registers `flow.eval` into a Lua state
 
 ## Quick start (sync)
@@ -57,7 +57,7 @@ struct AsyncFixture;
 
 #[async_trait]
 impl AsyncDispatcher for AsyncFixture {
-    async fn dispatch_async(&self, _r: &str, input: Value) -> Result<Value, EvalError> {
+    async fn dispatch(&self, _r: &str, input: Value) -> Result<Value, EvalError> {
         Ok(input)
     }
 }

@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 //! flow.ir Pure Rust schema + sync interpreter.
 //!
 //! Node kinds (Step / Seq / Branch / Fanout / Loop / Try / Assign) + Expr ops
@@ -42,33 +43,43 @@ use serde_json::Value;
 use thiserror::Error;
 
 // ──────────────────────────────────────────────────────────────────────────
-// IR: 3 Node kinds + 3 Expr ops
+// IR: 7 Node kinds + 20 Expr ops
 // ──────────────────────────────────────────────────────────────────────────
 
 /// flow.ir Node kind.
 ///
 /// Discriminated with `kind` tag, `deny_unknown_fields` (open=false),
-/// `rename_all = "snake_case"`. Parser-side coverage: Step / Seq / Branch +
-/// Fanout (canonical schema の `fanout` Node、 4 join mode)。 残り Node kind
-/// (let / loop / call / switch / try / map / reduce / etc) は別 turn carry。
+/// `rename_all = "snake_case"`. Covers the 7 supported kinds: `Step` / `Seq`
+/// / `Branch` / `Fanout` (canonical schema の `fanout` Node、 4 join mode) /
+/// `Loop` / `Try` / `Assign`. Additional kinds may be added in future
+/// versions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum Node {
     /// `Step` — dispatch a referenced operation with `in` input, write result to `out`.
     Step {
+        /// Dispatcher key (wire field `ref`), resolved via [`Dispatcher::dispatch`].
         #[serde(rename = "ref")]
         ref_: String,
+        /// Input `Expr`, evaluated against the ctx snapshot before dispatch (wire field `in`).
         #[serde(rename = "in")]
         in_: Expr,
+        /// `Path` `Expr` the dispatcher's output is written to.
         out: Expr,
     },
     /// `Seq` — evaluate children in order, threading the context value through.
-    Seq { children: Vec<Node> },
+    Seq {
+        /// Child nodes, evaluated in order.
+        children: Vec<Node>,
+    },
     /// `Branch` — eval `cond`; if `true` run `then`, else run `else`.
     Branch {
+        /// Condition `Expr`; must evaluate to a JSON boolean.
         cond: Expr,
+        /// Branch taken when `cond` is `true` (wire field `then`).
         #[serde(rename = "then")]
         then_: Box<Node>,
+        /// Branch taken when `cond` is `false` (wire field `else`).
         #[serde(rename = "else")]
         else_: Box<Node>,
     },
@@ -77,26 +88,38 @@ pub enum Node {
     /// per `join` mode into `out`. Async parallel runner uses
     /// `futures::future::{try_join_all|select_ok|join_all}` (executor-agnostic).
     Fanout {
+        /// `Expr` evaluated to a JSON array; one branch runs per element.
         items: Expr,
+        /// `Path` `Expr` each branch's item is written to before running `body`.
         bind: Expr,
+        /// Node run once per `items` element, against a disjoint branch ctx.
         body: Box<Node>,
+        /// How per-branch results are combined into `out`.
         join: JoinMode,
+        /// `Path` `Expr` the joined result is written to.
         out: Expr,
     },
     /// `Loop` — counter を 0 から、 `cond` が truthy かつ `counter < max` の間
     /// `body` を eval。 各 iter 後 counter を increment して `counter` path に書く。
     /// VerdictLoop 等の retry/poll パターン primitive (canonical schema 整合)。
     Loop {
+        /// `Path` `Expr` the iteration counter is written to (starts at `0`).
         counter: Expr,
+        /// Condition re-evaluated before each iteration; loop stops once falsy.
         cond: Expr,
+        /// Node evaluated once per iteration.
         body: Box<Node>,
+        /// Hard iteration cap (loop stops once `counter >= max`, regardless of `cond`).
         max: u32,
     },
     /// `Try` — `body` を eval、 raise した場合 `catch` を eval。
     /// `err_at` が Some なら catch 開始前に error message を ctx に書く。
     Try {
+        /// Node evaluated first; failures trigger a ctx rollback + `catch`.
         body: Box<Node>,
+        /// Node evaluated when `body` raises.
         catch: Box<Node>,
+        /// Optional `Path` `Expr` the error message is written to before `catch` runs.
         #[serde(default)]
         err_at: Option<Expr>,
     },
@@ -104,7 +127,12 @@ pub enum Node {
     /// 結果を `at` (Path Expr) に write する。 dispatcher 不要、 副作用は
     /// `CtxStorage.write` 1 回のみ。 `Seq` の中で Step 間の Adhoc update 表現に
     /// 使う (= IR primitive、 Command 履歴は CtxStorage の write hook 経由で取得)。
-    Assign { at: Expr, value: Expr },
+    Assign {
+        /// `Path` `Expr` the evaluated `value` is written to.
+        at: Expr,
+        /// `Expr` evaluated against the ctx snapshot.
+        value: Expr,
+    },
 }
 
 /// Fanout join semantics (Promise / futures combinators).
@@ -144,50 +172,134 @@ pub enum JoinMode {
 #[serde(tag = "op", deny_unknown_fields, rename_all = "snake_case")]
 pub enum Expr {
     /// `Path` — read a value from ctx by simple `$.a.b.c` form.
-    Path { at: String },
+    Path {
+        /// The `$.a.b.c` (or bracket-notation) path string — see [`read_path`].
+        at: String,
+    },
     /// `Lit` — literal JSON value.
-    Lit { value: Value },
-    /// `Eq` — boolean equality of two sub-expressions.
-    Eq { lhs: Box<Expr>, rhs: Box<Expr> },
-    /// `Ne` — boolean inequality.
-    Ne { lhs: Box<Expr>, rhs: Box<Expr> },
+    Lit {
+        /// The literal value, returned as-is on evaluation.
+        value: Value,
+    },
+    /// `Eq` — boolean equality of two sub-expressions. Numbers compare by
+    /// f64 value (`5 == 5.0` is `true`), matching the ordering ops' numeric
+    /// coercion; integers above 2^53 may lose precision (same caveat as
+    /// `Lt`/`Lte`/`Gt`/`Gte`).
+    Eq {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
+    /// `Ne` — boolean inequality. Same numeric coercion as `Eq` (`5 != 5.0`
+    /// is `false`); precision caveat above 2^53 shared with ordering ops.
+    Ne {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Lt` — `lhs < rhs`. Both numbers (f64) or both strings (lexicographic),
     /// mirroring canonical Lua `<` semantics. Mixed / other types raise.
-    Lt { lhs: Box<Expr>, rhs: Box<Expr> },
+    Lt {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Lte` — `lhs <= rhs` (canonical wire tag `lte`).
-    Lte { lhs: Box<Expr>, rhs: Box<Expr> },
+    Lte {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Gt` — `lhs > rhs`.
-    Gt { lhs: Box<Expr>, rhs: Box<Expr> },
+    Gt {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Gte` — `lhs >= rhs` (canonical wire tag `gte`).
-    Gte { lhs: Box<Expr>, rhs: Box<Expr> },
+    Gte {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Not` — boolean negation of `arg` (truthy-based; null/false → true).
-    Not { arg: Box<Expr> },
+    Not {
+        /// Operand negated by truthiness.
+        arg: Box<Expr>,
+    },
     /// `And` — variadic boolean conjunction (short-circuit). Empty list → true.
-    And { args: Vec<Expr> },
+    And {
+        /// Operands evaluated left-to-right until one is falsy.
+        args: Vec<Expr>,
+    },
     /// `Or` — variadic boolean disjunction (short-circuit). Empty list → false.
-    Or { args: Vec<Expr> },
+    Or {
+        /// Operands evaluated left-to-right until one is truthy.
+        args: Vec<Expr>,
+    },
     /// `Exists` — evaluate `arg`; `true` iff it resolves to a non-null value.
     /// A `Path` arg that raises `PathNotFound` yields `false` (canonical
     /// `arg ~= nil` semantics — JSON null maps to Lua nil).
-    Exists { arg: Box<Expr> },
+    Exists {
+        /// Operand whose presence (non-null, resolvable) is tested.
+        arg: Box<Expr>,
+    },
     /// `Add` — numeric `lhs + rhs` (f64).
-    Add { lhs: Box<Expr>, rhs: Box<Expr> },
+    Add {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Sub` — numeric `lhs - rhs`.
-    Sub { lhs: Box<Expr>, rhs: Box<Expr> },
+    Sub {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Mul` — numeric `lhs * rhs`.
-    Mul { lhs: Box<Expr>, rhs: Box<Expr> },
+    Mul {
+        /// Left-hand operand.
+        lhs: Box<Expr>,
+        /// Right-hand operand.
+        rhs: Box<Expr>,
+    },
     /// `Div` — numeric `lhs / rhs`. Division by zero raises `DispatcherError`.
-    Div { lhs: Box<Expr>, rhs: Box<Expr> },
+    Div {
+        /// Left-hand operand (dividend).
+        lhs: Box<Expr>,
+        /// Right-hand operand (divisor).
+        rhs: Box<Expr>,
+    },
     /// `Mod` — numeric `lhs % rhs` (Lua `%` semantics: result takes the sign
     /// of `rhs`). Modulo by zero raises `DispatcherError`.
-    Mod { lhs: Box<Expr>, rhs: Box<Expr> },
+    Mod {
+        /// Left-hand operand (dividend).
+        lhs: Box<Expr>,
+        /// Right-hand operand (divisor).
+        rhs: Box<Expr>,
+    },
     /// `Len` — length of `arg`: array → element count, string → char count,
     /// object → key count. Other types raise `DispatcherError`.
-    Len { arg: Box<Expr> },
+    Len {
+        /// Operand whose length is computed.
+        arg: Box<Expr>,
+    },
     /// `In` — `true` if `needle` equals any element of `haystack` (which must
     /// evaluate to an array). Rust-side extension (not in canonical schema).
+    /// Element equality uses the same numeric coercion as `Eq` (`5 == 5.0`);
+    /// precision caveat above 2^53 shared with ordering ops.
     In {
+        /// Value tested for membership.
         needle: Box<Expr>,
+        /// Operand that must evaluate to a JSON array.
         haystack: Box<Expr>,
     },
     /// `CallExtern` — value-shape Hatch: resolve a host-injected pure function
@@ -195,8 +307,10 @@ pub enum Expr {
     /// return the value. The registered function MUST be pure (no side
     /// effects, no flow control) — see canonical `doc/ir.md §call_extern`.
     CallExtern {
+        /// Extern registry key (wire field `ref`), resolved via [`Externs::call`].
         #[serde(rename = "ref")]
         ref_: String,
+        /// Argument expressions, evaluated before the extern call.
         args: Vec<Expr>,
     },
 }
@@ -213,6 +327,7 @@ pub enum Expr {
 /// `Fn(&str, Value) -> Result<Value, EvalError>` closures also implement this
 /// trait via the blanket impl below.
 pub trait Dispatcher {
+    /// Resolve `ref_` against `input`, returning the step's raw output value.
     fn dispatch(&self, ref_: &str, input: Value) -> Result<Value, EvalError>;
 }
 
@@ -228,16 +343,33 @@ where
 /// Evaluation error.
 #[derive(Debug, Error)]
 pub enum EvalError {
+    /// A `Path` read did not resolve — the requested key is missing from ctx.
     #[error("path not found: {0}")]
     PathNotFound(String),
+    /// A `Path` string is malformed (missing `$`/`$.` prefix, unterminated
+    /// bracket segment, etc. — see [`read_path`] / [`write_path`] docs).
     #[error("invalid path syntax: {0}")]
     InvalidPath(String),
+    /// `Branch.cond` evaluated to a non-boolean value.
     #[error("branch cond must be boolean, got: {0}")]
     NonBoolCond(Value),
+    /// The [`Dispatcher`] returned an error for the given `Step.ref`.
     #[error("dispatcher error for ref '{ref_}': {msg}")]
-    DispatcherError { ref_: String, msg: String },
+    DispatcherError {
+        /// The `Step.ref` (or synthetic op label) that raised.
+        ref_: String,
+        /// The dispatcher's error message.
+        msg: String,
+    },
+    /// The [`Externs`] registry raised for the given `call_extern.ref` (e.g.
+    /// unregistered ref, or the extern fn itself returned an error).
     #[error("extern error for ref '{ref_}': {msg}")]
-    ExternError { ref_: String, msg: String },
+    ExternError {
+        /// The `call_extern.ref` that raised.
+        ref_: String,
+        /// The extern fn's error message.
+        msg: String,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -283,10 +415,13 @@ pub type ExternFn = Box<dyn Fn(&[Value]) -> Result<Value, EvalError> + Send + Sy
 ///
 /// let mut externs = ExternMap::new();
 /// externs.register("math.sqrt", |args: &[Value]| {
-///     let x = args[0].as_f64().ok_or_else(|| EvalError::ExternError {
-///         ref_: "math.sqrt".into(),
-///         msg: "expected number".into(),
-///     })?;
+///     let x = args
+///         .first()
+///         .and_then(|v| v.as_f64())
+///         .ok_or_else(|| EvalError::ExternError {
+///             ref_: "math.sqrt".into(),
+///             msg: "expected number".into(),
+///         })?;
 ///     Ok(json!(x.sqrt()))
 /// });
 ///
@@ -664,8 +799,8 @@ pub fn eval_expr_with_externs(
     match expr {
         Expr::Lit { value } => Ok(value.clone()),
         Expr::Path { at } => read_path(at, ctx),
-        Expr::Eq { lhs, rhs } => Ok(Value::Bool(ev(lhs)? == ev(rhs)?)),
-        Expr::Ne { lhs, rhs } => Ok(Value::Bool(ev(lhs)? != ev(rhs)?)),
+        Expr::Eq { lhs, rhs } => Ok(Value::Bool(json_eq(&ev(lhs)?, &ev(rhs)?))),
+        Expr::Ne { lhs, rhs } => Ok(Value::Bool(!json_eq(&ev(lhs)?, &ev(rhs)?))),
         Expr::Lt { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_lt()),
         Expr::Lte { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_le()),
         Expr::Gt { lhs, rhs } => ord_cmp(&ev(lhs)?, &ev(rhs)?, |o| o.is_gt()),
@@ -731,7 +866,7 @@ pub fn eval_expr_with_externs(
             let n = ev(needle)?;
             let h = ev(haystack)?;
             match h {
-                Value::Array(a) => Ok(Value::Bool(a.iter().any(|e| e == &n))),
+                Value::Array(a) => Ok(Value::Bool(a.iter().any(|e| json_eq(e, &n)))),
                 other => Err(EvalError::DispatcherError {
                     ref_: "expr.in".into(),
                     msg: format!("in: haystack must be array, got {other:?}"),
@@ -745,6 +880,30 @@ pub fn eval_expr_with_externs(
             }
             externs.call(ref_, &vals)
         }
+    }
+}
+
+/// Deep equality with Lua-parity numeric coercion: numbers compare by
+/// f64 value (so `5 == 5.0`), matching the coercion Lt/Lte/Gt/Gte use.
+/// Integers above 2^53 may lose precision — same caveat as ordering ops.
+fn json_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(na), Value::Number(nb)) => match (na.as_f64(), nb.as_f64()) {
+            (Some(fa), Some(fb)) => fa == fb,
+            // non-f64-representable (e.g. integers beyond 2^53): fall back
+            // to exact comparison rather than a lossy f64 round-trip.
+            _ => na == nb,
+        },
+        (Value::Array(aa), Value::Array(ab)) => {
+            aa.len() == ab.len() && aa.iter().zip(ab.iter()).all(|(x, y)| json_eq(x, y))
+        }
+        (Value::Object(oa), Value::Object(ob)) => {
+            oa.len() == ob.len()
+                && oa
+                    .iter()
+                    .all(|(k, v)| ob.get(k).is_some_and(|ov| json_eq(v, ov)))
+        }
+        _ => a == b,
     }
 }
 

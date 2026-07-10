@@ -13,8 +13,8 @@ No mlua, no async, no I/O — pure schema + `eval` + `Dispatcher` trait.
 
 ## What's in
 
-- **3 Node kinds** — `Step { ref, in, out }`, `Seq { children }`, `Branch { cond, then, else }` (+ `Fanout` / `Loop` / `Try`)
-- **3 Expr ops** — `Path { at }`, `Lit { value }`, `Eq { lhs, rhs }`
+- **7 Node kinds** — `Step { ref, in, out }`, `Seq { children }`, `Branch { cond, then, else }`, `Fanout { items, bind, body, join, out }`, `Loop { counter, cond, body, max }`, `Try { body, catch, err_at }`, `Assign { at, value }`
+- **20 Expr ops** — read/literal (`Path`, `Lit`), comparison (`Eq`, `Ne`, `Lt`, `Lte`, `Gt`, `Gte`), boolean (`Not`, `And`, `Or`), existence (`Exists`), arithmetic (`Add`, `Sub`, `Mul`, `Div`, `Mod`), aggregate (`Len`, `In`), and the `CallExtern` hatch
 - **Discriminated unions** — `#[serde(tag = "kind")]` / `#[serde(tag = "op")]` + `deny_unknown_fields`
 - **`Dispatcher` trait** — host provides concrete `dispatch(&str, Value) -> Result<Value>` implementations
 
