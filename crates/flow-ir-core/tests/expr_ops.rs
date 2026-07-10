@@ -2,7 +2,9 @@
 //! and stage 2 (arithmetic + len + in), plus canonical-parity ops (mod /
 //! call_extern) and canonical wire-format checks (gte / lte / args / arg).
 
-use flow_ir_core::{eval_expr, eval_expr_with_externs, EvalError, Expr, ExternMap};
+use flow_ir_core::{
+    eval_expr, eval_expr_with_externs, read_path, write_path, EvalError, Expr, ExternMap,
+};
 use serde_json::json;
 
 fn lit(v: serde_json::Value) -> Box<Expr> {
@@ -541,4 +543,147 @@ fn parse_canonical_gte_lte_mod_call_extern() {
         eval_expr_with_externs(&e, &json!({}), &externs).unwrap(),
         json!(42)
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Path helpers: bracket notation (RFC 9535 style) for keys containing dots
+// ──────────────────────────────────────────────────────────────────────────
+
+fn path_expr(at: &str) -> Expr {
+    Expr::Path { at: at.into() }
+}
+
+#[test]
+fn read_path_bracket_basic() {
+    let ctx = json!({ "a": { "p.md": 1 } });
+    assert_eq!(read_path("$.a[\"p.md\"]", &ctx).unwrap(), json!(1));
+}
+
+#[test]
+fn read_path_bracket_then_dot() {
+    let ctx = json!({ "a": { "p.md": { "b": 2 } } });
+    assert_eq!(read_path("$.a[\"p.md\"].b", &ctx).unwrap(), json!(2));
+}
+
+#[test]
+fn read_path_bracket_leading() {
+    let ctx = json!({ "x.y": 3 });
+    assert_eq!(read_path("$[\"x.y\"]", &ctx).unwrap(), json!(3));
+}
+
+#[test]
+fn read_path_bracket_leading_then_dot() {
+    let ctx = json!({ "x.y": { "inner": 4 } });
+    assert_eq!(read_path("$[\"x.y\"].inner", &ctx).unwrap(), json!(4));
+}
+
+#[test]
+fn read_path_bracket_chained() {
+    let ctx = json!({ "a": { "x": { "y": 5 } } });
+    assert_eq!(read_path("$.a[\"x\"][\"y\"]", &ctx).unwrap(), json!(5));
+}
+
+#[test]
+fn read_path_bracket_missing_key_errors() {
+    let ctx = json!({ "a": {} });
+    let err = read_path("$.a[\"missing\"]", &ctx).unwrap_err();
+    assert!(matches!(err, EvalError::PathNotFound(_)), "{err:?}");
+}
+
+#[test]
+fn write_path_bracket_basic() {
+    let ctx = json!({});
+    let updated = write_path(&path_expr("$.a[\"p.md\"]"), ctx, json!(1)).unwrap();
+    assert_eq!(updated, json!({ "a": { "p.md": 1 } }));
+}
+
+#[test]
+fn write_path_bracket_creates_intermediate_objects() {
+    let ctx = json!({});
+    let updated = write_path(&path_expr("$.a[\"p.md\"].b"), ctx, json!(2)).unwrap();
+    assert_eq!(updated, json!({ "a": { "p.md": { "b": 2 } } }));
+}
+
+#[test]
+fn write_path_bracket_overwrites_existing_key() {
+    let ctx = json!({ "a": { "p.md": 1, "other": "keep" } });
+    let updated = write_path(&path_expr("$.a[\"p.md\"]"), ctx, json!(9)).unwrap();
+    assert_eq!(updated, json!({ "a": { "p.md": 9, "other": "keep" } }));
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Path helpers: dot-only regression (bracket notation must not change these)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn read_path_dot_only_unchanged() {
+    let ctx = json!({ "a": { "b": { "c": 42 } } });
+    assert_eq!(read_path("$.a.b.c", &ctx).unwrap(), json!(42));
+}
+
+#[test]
+fn read_path_whole_ctx_unchanged() {
+    let ctx = json!({ "a": 1 });
+    assert_eq!(read_path("$", &ctx).unwrap(), ctx);
+}
+
+#[test]
+fn read_path_dot_only_missing_key_errors() {
+    let ctx = json!({ "a": {} });
+    let err = read_path("$.a.missing", &ctx).unwrap_err();
+    assert!(matches!(err, EvalError::PathNotFound(_)), "{err:?}");
+}
+
+#[test]
+fn write_path_non_path_expr_errors() {
+    let ctx = json!({});
+    let err = write_path(&Expr::Lit { value: json!(1) }, ctx, json!(2)).unwrap_err();
+    assert!(matches!(err, EvalError::InvalidPath(_)), "{err:?}");
+}
+
+#[test]
+fn write_path_dot_only_unchanged() {
+    let ctx = json!({});
+    let updated = write_path(&path_expr("$.a.b.c"), ctx, json!(42)).unwrap();
+    assert_eq!(updated, json!({ "a": { "b": { "c": 42 } } }));
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Path helpers: bracket syntax errors (must raise InvalidPath, never
+// silently misparse)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn read_path_bracket_unterminated_errors() {
+    let ctx = json!({});
+    let err = read_path("$.a[", &ctx).unwrap_err();
+    assert!(matches!(err, EvalError::InvalidPath(_)), "{err:?}");
+}
+
+#[test]
+fn read_path_bracket_empty_errors() {
+    let ctx = json!({});
+    let err = read_path("$.a[]", &ctx).unwrap_err();
+    assert!(matches!(err, EvalError::InvalidPath(_)), "{err:?}");
+}
+
+#[test]
+fn read_path_bracket_unquoted_errors() {
+    let ctx = json!({});
+    let err = read_path("$.a[p.md]", &ctx).unwrap_err();
+    assert!(matches!(err, EvalError::InvalidPath(_)), "{err:?}");
+}
+
+#[test]
+fn read_path_bracket_empty_key_errors() {
+    let ctx = json!({});
+    let err = read_path("$.a[\"\"]", &ctx).unwrap_err();
+    assert!(matches!(err, EvalError::InvalidPath(_)), "{err:?}");
+}
+
+#[test]
+fn read_path_bracket_unseparated_plain_suffix_errors() {
+    let ctx = json!({});
+    let err = read_path("$.a[\"x\"]b", &ctx).unwrap_err();
+    assert!(matches!(err, EvalError::InvalidPath(_)), "{err:?}");
 }

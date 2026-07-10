@@ -809,26 +809,52 @@ where
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Path helpers (simple `$.a.b.c` form, no array index in MVP)
+// Path helpers — `$.a.b.c` dot form, plus RFC 9535 (JSONPath) style bracket
+// notation (`$.a["p.md"]`, `$["x.y"]`) for keys that contain a literal dot.
+// No array index support (MVP scope).
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Read a path from a JSON value. Supports simple `$.a.b.c` form.
+/// Read a path from a JSON value.
+///
+/// Supports the simple dot form `$.a.b.c`, plus RFC 9535-style bracket
+/// notation for object keys that contain a literal `.`: `$.a["p.md"]` reads
+/// `ctx.a["p.md"]`, and `$["x.y"]` reads `ctx["x.y"]`. Bracket segments may
+/// be chained directly (`$.a["x"]["y"]`) or followed by a dot segment
+/// (`$["x.y"].inner`). Bracket keys support no escaping — a literal `"` in
+/// a key cannot be represented.
+///
+/// Paths without `[` take the original dot-split code path unchanged
+/// (no behavioural change for existing callers).
 pub fn read_path(path: &str, ctx: &Value) -> Result<Value, EvalError> {
     let trimmed = strip_path_prefix(path)?;
     if trimmed.is_empty() {
         return Ok(ctx.clone());
     }
     let mut cur = ctx;
-    for key in trimmed.split('.') {
-        cur = cur
-            .get(key)
-            .ok_or_else(|| EvalError::PathNotFound(path.to_string()))?;
+    if trimmed.contains('[') {
+        let segments = parse_path_segments(trimmed)?;
+        for key in &segments {
+            cur = cur
+                .get(key.as_str())
+                .ok_or_else(|| EvalError::PathNotFound(path.to_string()))?;
+        }
+    } else {
+        for key in trimmed.split('.') {
+            cur = cur
+                .get(key)
+                .ok_or_else(|| EvalError::PathNotFound(path.to_string()))?;
+        }
     }
     Ok(cur.clone())
 }
 
 /// Write a value at the path location inside ctx, returning the updated ctx.
 /// `out` must be a `Path` Expr.
+///
+/// Accepts the same dot form and RFC 9535-style bracket notation as
+/// [`read_path`] (see its docs for syntax + examples). Intermediate objects
+/// along the path are created automatically, mirroring the existing
+/// dot-form behaviour.
 pub fn write_path(out: &Expr, ctx: Value, value: Value) -> Result<Value, EvalError> {
     let path = match out {
         Expr::Path { at } => at,
@@ -839,7 +865,15 @@ pub fn write_path(out: &Expr, ctx: Value, value: Value) -> Result<Value, EvalErr
         }
     };
     let trimmed = strip_path_prefix(path)?;
-    let keys: Vec<&str> = trimmed.split('.').filter(|s| !s.is_empty()).collect();
+    let keys: Vec<String> = if trimmed.contains('[') {
+        parse_path_segments(trimmed)?
+    } else {
+        trimmed
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    };
     if keys.is_empty() {
         return Ok(value);
     }
@@ -854,7 +888,98 @@ fn strip_path_prefix(path: &str) -> Result<&str, EvalError> {
         .ok_or_else(|| EvalError::InvalidPath(format!("path must start with $ or $.: {}", path)))
 }
 
-fn write_path_recursive(node: &mut Value, keys: &[&str], value: Value) {
+/// Parse a (prefix-stripped, non-empty) path string containing at least one
+/// `[` into its object-key segments. Supports:
+///
+/// - plain segment: any run of chars excluding `.` and `[`, non-empty.
+/// - bracket segment: `["<name>"]`, where `<name>` is one or more chars
+///   excluding `"` (no escape support — a key containing `"` is rejected).
+/// - plain segments are `.`-separated; a bracket segment may follow
+///   directly after the previous segment (`a["x"]`) or after a `.`
+///   (`a.["x"]`), and a bracket segment may itself be followed directly by
+///   another bracket (`a["x"]["y"]`) or by a `.` before the next plain
+///   segment (`a["x"].b`).
+///
+/// Any malformed sequence (unterminated bracket, missing quote, empty key,
+/// empty segment, bracket directly followed by an unseparated plain
+/// segment, ...) raises `EvalError::InvalidPath` — this parser never
+/// silently misparses.
+fn parse_path_segments(trimmed: &str) -> Result<Vec<String>, EvalError> {
+    fn invalid(trimmed: &str, reason: &str) -> EvalError {
+        EvalError::InvalidPath(format!("{reason}: {trimmed}"))
+    }
+
+    let bytes = trimmed.as_bytes();
+    let len = bytes.len();
+    let mut segments = Vec::new();
+    let mut i = 0usize;
+    // true at path start and immediately after a `.`: the next byte must
+    // begin a new segment (plain or bracket), not another `.` or EOF.
+    let mut expect_segment_start = true;
+
+    while i < len {
+        match bytes[i] {
+            b'[' => {
+                if i + 1 >= len || bytes[i + 1] != b'"' {
+                    return Err(invalid(trimmed, "expected '\"' after '['"));
+                }
+                let name_start = i + 2;
+                let mut j = name_start;
+                while j < len && bytes[j] != b'"' {
+                    j += 1;
+                }
+                if j >= len {
+                    return Err(invalid(trimmed, "unterminated bracket segment"));
+                }
+                let name = &trimmed[name_start..j];
+                if name.is_empty() {
+                    return Err(invalid(trimmed, "empty bracket key"));
+                }
+                if j + 1 >= len || bytes[j + 1] != b']' {
+                    return Err(invalid(trimmed, "missing closing ']' after key"));
+                }
+                segments.push(name.to_string());
+                i = j + 2;
+                expect_segment_start = false;
+                // Only `.` or another `[` (or EOF) may directly follow a
+                // bracket segment — a bare plain-segment continuation
+                // (`a["x"]b`) is ambiguous and rejected.
+                if i < len && bytes[i] != b'.' && bytes[i] != b'[' {
+                    return Err(invalid(
+                        trimmed,
+                        "expected '.' or '[' after bracket segment",
+                    ));
+                }
+            }
+            b'.' => {
+                if expect_segment_start {
+                    return Err(invalid(trimmed, "empty path segment"));
+                }
+                i += 1;
+                expect_segment_start = true;
+                if i >= len {
+                    return Err(invalid(trimmed, "empty path segment"));
+                }
+            }
+            _ => {
+                let start = i;
+                while i < len && bytes[i] != b'.' && bytes[i] != b'[' {
+                    i += 1;
+                }
+                segments.push(trimmed[start..i].to_string());
+                expect_segment_start = false;
+            }
+        }
+    }
+
+    if expect_segment_start {
+        return Err(invalid(trimmed, "empty path segment"));
+    }
+
+    Ok(segments)
+}
+
+fn write_path_recursive(node: &mut Value, keys: &[String], value: Value) {
     if keys.is_empty() {
         *node = value;
         return;
@@ -863,12 +988,12 @@ fn write_path_recursive(node: &mut Value, keys: &[&str], value: Value) {
         *node = Value::Object(serde_json::Map::new());
     }
     let obj = node.as_object_mut().expect("just initialised as object");
-    let key = keys[0];
+    let key = &keys[0];
     if keys.len() == 1 {
-        obj.insert(key.to_string(), value);
+        obj.insert(key.clone(), value);
     } else {
         let entry = obj
-            .entry(key.to_string())
+            .entry(key.clone())
             .or_insert(Value::Object(serde_json::Map::new()));
         write_path_recursive(entry, &keys[1..], value);
     }
