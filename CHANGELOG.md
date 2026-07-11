@@ -8,17 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
-- `flow_ir_core::Path` — a typed, parsed context path (parse-don't-validate). `Expr::Path.at` (and every other path-carrying field, via the same `Expr::Path`) is now a `Path`, deserialize-time-validated, rather than a raw `String`. `PathParseError` is the dedicated parse-error type surfaced through `Path`'s `Deserialize` impl and through the `read_path`/`write_path` `&str` compat wrappers (as `EvalError::InvalidPath`).
-- `EvalError::TypeError { op, msg }` — an expression/node received a value of the wrong type.
-- `EvalError::ArithError { op, msg }` — an arithmetic operation failed (division/modulo by zero, or a numeric value that cannot be represented as `f64`).
-
 ### Changed
-
-- **Breaking (path syntax)** — malformed path syntax is now rejected uniformly, at parse time (`Path::from_str`, exercised at deserialize time for `Expr::Path.at` and friends): a path not starting with `$` followed immediately by `.`, `[`, or end-of-string is rejected (`$foo` used to be silently accepted as a 1-segment dot path); any empty dot segment (`$.`, `$.a.`, `$.a..b`) is rejected (previously silently dropped on write, or surfaced as `PathNotFound` rather than `InvalidPath` on read, depending on whether the ctx happened to have a key `""` at that position).
-- **Breaking (write semantics)** — writing through a path whose intermediate segment already holds a concrete non-object value (string, number, bool, array) now raises `EvalError::TypeError` instead of silently clobbering it with a fresh object. `null`/absent intermediates still auto-promote to an empty object, unchanged.
-- **Breaking (Fanout empty items)** — `Any`/`Race` with an empty `items` array now raise `EvalError::TypeError` (Promise.any/Promise.race parity: zero items can never produce a winner) instead of returning `Value::Array([])`. `All`/`AllSettled` are unchanged (still return `[]`, consistent with their array-shaped result). Sync (`flow-ir-core`) and async (`mlua-flow-ir`) evaluators are in lockstep on this.
-- **Breaking (`EvalError`)** — the enum is now `#[non_exhaustive]`; match on it with a wildcard arm. `DispatcherError`/`ExternError` are now raised exclusively for real `Dispatcher`/`Externs` failures — every synthetic-`ref_` internal-evaluator error (`"expr.len"`, `"expr.in"`, `"expr.cmp"`, `"expr.{op}"` arithmetic ops, `"fanout.items"`) has been rerouted to `TypeError` or `ArithError`, matching the failure's actual nature (wrong type vs. arithmetic failure).
-- `read_path`/`write_path` keep their existing `&str`-in signatures as thin wrappers over `Path`; internal `Node`/`Expr` evaluation now walks an already-parsed `Path` directly rather than re-parsing a path string on every read/write.
 
 ### Deprecated
 
@@ -27,6 +17,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ### Fixed
 
 ### Security
+
+## [0.2.0] — 2026-07-11
+
+### Added
+
+- `flow_ir_core::Path` — a typed, parsed context path (parse-don't-validate). `Expr::Path.at` (and every other path-carrying field, via the same `Expr::Path`) is now a `Path`, deserialize-time-validated, rather than a raw `String`. `PathParseError` is the dedicated parse-error type surfaced through `Path`'s `Deserialize` impl and through the `read_path`/`write_path` `&str` compat wrappers (as `EvalError::InvalidPath`).
+- `EvalError::TypeError { op, msg }` — an expression/node received a value of the wrong type.
+- `EvalError::ArithError { op, msg }` — an arithmetic operation failed (division/modulo by zero, or a numeric value that cannot be represented as `f64`).
+- `mlua-flow-ir` feature flags — `mlua` is now an optional dependency with Lua-version passthrough features (`lua51`/`lua52`/`lua53`/`lua54`/`luajit`/`luau`) and a weak `vendored` feature. `default = ["lua54", "vendored"]` keeps existing consumers unchanged; `default-features = false` gives an async-only build (no Lua binding, no vendored C compilation).
+- CI (GitHub Actions): fmt / clippy `-D warnings` / tests / rustdoc `-D missing_docs` gates plus an MSRV (1.77) check and an async-only (`--no-default-features`) build check.
+
+### Changed
+
+- **Breaking (path syntax)** — malformed path syntax is now rejected uniformly, at parse time (`Path::from_str`, exercised at deserialize time for `Expr::Path.at` and friends): a path not starting with `$` followed immediately by `.`, `[`, or end-of-string is rejected (`$foo` used to be silently accepted as a 1-segment dot path); any empty dot segment (`$.`, `$.a.`, `$.a..b`) is rejected (previously silently dropped on write, or surfaced as `PathNotFound` rather than `InvalidPath` on read, depending on whether the ctx happened to have a key `""` at that position).
+- **Breaking (write semantics)** — writing through a path whose intermediate segment already holds a concrete non-object value (string, number, bool, array) now raises `EvalError::TypeError` instead of silently clobbering it with a fresh object. `null`/absent intermediates still auto-promote to an empty object, unchanged.
+- **Breaking (Fanout empty items)** — `Any`/`Race` with an empty `items` array now raise `EvalError::TypeError` (Promise.any/Promise.race parity: zero items can never produce a winner) instead of returning `Value::Array([])`. `All`/`AllSettled` are unchanged (still return `[]`, consistent with their array-shaped result). Sync (`flow-ir-core`) and async (`mlua-flow-ir`) evaluators are in lockstep on this.
+- **Breaking (`EvalError`)** — the enum is now `#[non_exhaustive]`; match on it with a wildcard arm. `DispatcherError`/`ExternError` are now raised exclusively for real `Dispatcher`/`Externs` failures — every synthetic-`ref_` internal-evaluator error (`"expr.len"`, `"expr.in"`, `"expr.cmp"`, `"expr.{op}"` arithmetic ops, `"fanout.items"`) has been rerouted to `TypeError` or `ArithError`, matching the failure's actual nature (wrong type vs. arithmetic failure).
+- `read_path`/`write_path` keep their existing `&str`-in signatures as thin wrappers over `Path`; internal `Node`/`Expr` evaluation now walks an already-parsed `Path` directly rather than re-parsing a path string on every read/write.
+- **Breaking (numeric equality)** — `Eq`/`Ne`/`In` now compare numbers by value with Lua parity (`5 == 5.0` is true), matching the f64 coercion `Lt`/`Lte`/`Gt`/`Gte` already used. Previously `serde_json::Value`'s `PartialEq` distinguished integer and float representations, so `eq(add(2,3), lit(5))` evaluated to `false` (arithmetic ops always emit floats). Integers above 2^53 share the same precision caveat as the ordering ops.
+
+### Fixed
+
+- crates.io README for `mlua-flow-ir`: the async example implemented a nonexistent `dispatch_async` method (the trait method is `dispatch`).
+- Stale README claims: "3 Node + 3 Expr" (actual: 7 Node kinds + 20 Expr ops) and a roadmap stuck at "v0.0.4 (current)".
+- Missing rustdoc: `#![warn(missing_docs)]` is now enforced on both crates and every public item is documented.
 
 ## [0.1.2] — 2026-07-10
 

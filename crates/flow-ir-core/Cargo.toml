@@ -1,6 +1,6 @@
 [package]
 name = "flow-ir-core"
-version = "0.1.2"
+version = "0.2.0"
 description = "flow.ir Pure Rust schema + sync interpreter — Node / Expr / Dispatcher / eval (no mlua, no async)"
 documentation = "https://docs.rs/flow-ir-core"
 keywords = ["flow", "ir", "interpreter", "dsl", "dispatcher"]
