@@ -129,23 +129,23 @@ async fn external_task_injects_state_during_step_await() {
         .expect("eval_async_with_storage failed");
     mutator.await.expect("mutator task panicked");
 
-    let final_ctx = storage.snapshot();
+    let final_state = storage.snapshot();
     // Step 1 の出力 (dispatch 戻り値) が書き込まれていること
     assert_eq!(
-        final_ctx.pointer("/signal_received/signaled"),
+        final_state.pointer("/signal_received/signaled"),
         Some(&json!(true)),
-        "Step 1 dispatch result not written: {final_ctx:#?}"
+        "Step 1 dispatch result not written: {final_state:#?}"
     );
     // 真の証明: 外部 task が dispatch.await 中に書いた値が
     // Step 2 の input (snapshot 経由) として読まれ、 echo 経由で out に届いている
     assert_eq!(
-        final_ctx.pointer("/echoed"),
+        final_state.pointer("/echoed"),
         Some(&json!(42)),
-        "External write during suspend was NOT observed by next Step: {final_ctx:#?}"
+        "External write during suspend was NOT observed by next Step: {final_state:#?}"
     );
     // Flow IR 内に Assign は無いので、 $.injected が ctx に存在する事実自体
     // が「IR 外からの動的注入」 の証拠
-    assert_eq!(final_ctx.pointer("/injected"), Some(&json!(42)));
+    assert_eq!(final_state.pointer("/injected"), Some(&json!(42)));
 }
 
 /// 二段目の証明: 外部 task が `eval_expr` を **runtime に動的構築** して
@@ -200,11 +200,11 @@ async fn external_task_constructs_expr_at_runtime_and_writes() {
         .expect("eval failed");
     mutator.await.expect("mutator panicked");
 
-    let final_ctx = storage.snapshot();
+    let final_state = storage.snapshot();
     assert_eq!(
-        final_ctx.pointer("/runtime_injected"),
+        final_state.pointer("/runtime_injected"),
         Some(&json!(100)),
-        "runtime-constructed Expr eval result not written: {final_ctx:#?}"
+        "runtime-constructed Expr eval result not written: {final_state:#?}"
     );
 }
 
@@ -243,7 +243,7 @@ async fn let_node_writes_value_inline() {
         .await
         .expect("eval failed");
 
-    let final_ctx = storage.snapshot();
-    assert_eq!(final_ctx.pointer("/y"), Some(&json!(42)));
-    assert_eq!(final_ctx.pointer("/z"), Some(&json!(42)));
+    let final_state = storage.snapshot();
+    assert_eq!(final_state.pointer("/y"), Some(&json!(42)));
+    assert_eq!(final_state.pointer("/z"), Some(&json!(42)));
 }
