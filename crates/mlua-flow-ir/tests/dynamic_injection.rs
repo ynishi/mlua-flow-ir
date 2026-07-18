@@ -5,7 +5,7 @@
 //! `Arc<dyn CtxStorage>` を経由して ctx を mutate し、 その変更が resume 後の
 //! 後続 Step で観測されることを **mock なし** で証明する。
 //!
-//! 不正証明 (= "事前コンパイルした Assign を IR に仕込んだだけ" を排除する
+//! 不正証明 (= "事前コンパイルした Let を IR に仕込んだだけ" を排除する
 //! ための制約):
 //!
 //! 1. Flow IR には `Node::Let` を **一切含めない** (Step のみ)
@@ -143,7 +143,7 @@ async fn external_task_injects_state_during_step_await() {
         Some(&json!(42)),
         "External write during suspend was NOT observed by next Step: {final_state:#?}"
     );
-    // Flow IR 内に Assign は無いので、 $.injected が ctx に存在する事実自体
+    // Flow IR 内に Let は無いので、 $.injected が ctx に存在する事実自体
     // が「IR 外からの動的注入」 の証拠
     assert_eq!(final_state.pointer("/injected"), Some(&json!(42)));
 }
@@ -187,7 +187,7 @@ async fn external_task_constructs_expr_at_runtime_and_writes() {
         };
         let snap = storage_for_external.snapshot();
         let resolved = eval_expr(&dynamic_expr, &snap).expect("runtime eval_expr failed");
-        // 評価結果を別 path に書く (Assign Node 経由ではない、 直 write)
+        // 評価結果を別 path に書く (Let Node 経由ではない、 直 write)
         storage_for_external
             .write("$.runtime_injected", resolved)
             .expect("ctx.write failed");

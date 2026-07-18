@@ -13,7 +13,7 @@ No mlua, no async, no I/O — pure schema + `eval` + `Dispatcher` trait.
 
 ## What's in
 
-- **7 Node kinds** — `Step { ref, in, out }`, `Seq { children }`, `Branch { cond, then, else }`, `Fanout { items, bind, body, join, out }`, `Loop { counter, cond, body, max }`, `Try { body, catch, err_at }`, `Assign { at, value }`
+- **7 Node kinds** — `Step { ref, in, out }`, `Seq { children }`, `Branch { cond, then, else }`, `Fanout { items, bind, body, join, out }`, `Loop { counter, cond, body, max }`, `Try { body, catch, err_at }`, `Let { at, value }` (canonical `let` — v0.3.0 rename from `Assign`, see root [Migration](../../README.md#migration-v030))
 - **20 Expr ops** — read/literal (`Path`, `Lit`), comparison (`Eq`, `Ne`, `Lt`, `Lte`, `Gt`, `Gte`), boolean (`Not`, `And`, `Or`), existence (`Exists`), arithmetic (`Add`, `Sub`, `Mul`, `Div`, `Mod`), aggregate (`Len`, `In`), and the `CallExtern` hatch
 - **Discriminated unions** — `#[serde(tag = "kind")]` / `#[serde(tag = "op")]` + `deny_unknown_fields`
 - **`Dispatcher` trait** — host provides concrete `dispatch(&str, Value) -> Result<Value>` implementations
