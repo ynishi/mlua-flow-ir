@@ -8,7 +8,7 @@
 //! 不正証明 (= "事前コンパイルした Assign を IR に仕込んだだけ" を排除する
 //! ための制約):
 //!
-//! 1. Flow IR には `Node::Assign` を **一切含めない** (Step のみ)
+//! 1. Flow IR には `Node::Let` を **一切含めない** (Step のみ)
 //! 2. dispatcher は 1 経路で本物の `tokio::sync::oneshot` を用いて suspend
 //! 3. 外部 task は **dispatcher が ready を signal した後** に ctx.write を
 //!    実行 (= dispatch.await の suspend 期間中であることを barrier で保証)
@@ -88,7 +88,7 @@ async fn external_task_injects_state_during_step_await() {
         release_rx: Mutex::new(Some(release_rx)),
     };
 
-    // Flow IR: Step だけで構成、 Node::Assign は **一切含めない**
+    // Flow IR: Step だけで構成、 Node::Let は **一切含めない**
     let flow = Node::Seq {
         children: vec![
             Node::Step {
@@ -208,10 +208,10 @@ async fn external_task_constructs_expr_at_runtime_and_writes() {
     );
 }
 
-/// Assign Node primitive 単体の smoke (E2E ではない、 IR primitive 確認用)。
-/// 既存 IR と Assign の co-existence、 Seq での Step ↔ Assign 混在を検証。
+/// Let Node primitive 単体の smoke (E2E ではない、 IR primitive 確認用)。
+/// 既存 IR と Let の co-existence、 Seq での Step ↔ Let 混在を検証。
 #[tokio::test]
-async fn assign_node_writes_value_inline() {
+async fn let_node_writes_value_inline() {
     struct EchoDispatcher;
     #[async_trait]
     impl AsyncDispatcher for EchoDispatcher {
@@ -223,10 +223,8 @@ async fn assign_node_writes_value_inline() {
     let storage = MemoryCtx::shared(json!({ "x": 1 }));
     let flow = Node::Seq {
         children: vec![
-            Node::Assign {
-                at: Expr::Path {
-                    at: "$.y".parse().unwrap(),
-                },
+            Node::Let {
+                at: "ctx.y".parse().unwrap(),
                 value: Expr::Lit { value: json!(42) },
             },
             Node::Step {

@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 //! flow.ir Pure Rust schema + sync interpreter.
 //!
-//! Node kinds (Step / Seq / Branch / Fanout / Loop / Try / Assign) + Expr ops
+//! Node kinds (Step / Seq / Branch / Fanout / Loop / Try / Let) + Expr ops
 //! (canonical wire format — comparison / boolean / existence / arithmetic /
 //! aggregate / `call_extern`) + sync `eval` + `Dispatcher` trait + `Externs`
 //! registry + typed [`Path`] read/write (see [`Path`] for the full path
@@ -56,8 +56,9 @@ pub use path::{Path, PathParseError};
 /// Discriminated with `kind` tag, `deny_unknown_fields` (open=false),
 /// `rename_all = "snake_case"`. Covers the 7 supported kinds: `Step` / `Seq`
 /// / `Branch` / `Fanout` (canonical schema の `fanout` Node、 4 join mode) /
-/// `Loop` / `Try` / `Assign`. Additional kinds may be added in future
-/// versions.
+/// `Loop` / `Try` / `Let` (canonical `let` — see the [`Node::Let`] variant
+/// for the v0.3.0 rename from `Assign` and the accompanying `at` field
+/// shape change). Additional kinds may be added in future versions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum Node {
@@ -128,13 +129,22 @@ pub enum Node {
         #[serde(default)]
         err_at: Option<Expr>,
     },
-    /// `Assign` — pure transform Node。 `value` Expr を ctx snapshot 上で評価し、
-    /// 結果を `at` (Path Expr) に write する。 dispatcher 不要、 副作用は
-    /// `CtxStorage.write` 1 回のみ。 `Seq` の中で Step 間の Adhoc update 表現に
-    /// 使う (= IR primitive、 Command 履歴は CtxStorage の write hook 経由で取得)。
-    Assign {
-        /// `Path` `Expr` the evaluated `value` is written to.
-        at: Expr,
+    /// `Let` — pure transform Node (canonical `let`). `value` Expr を ctx
+    /// snapshot 上で評価し、 結果を `at` ([`Path`]) に write する。 dispatcher
+    /// 不要、 副作用は `CtxStorage.write` 1 回のみ。 `Seq` の中で Step 間の
+    /// Adhoc update 表現に使う (= IR primitive、 Command 履歴は CtxStorage の
+    /// write hook 経由で取得)。
+    ///
+    /// **v0.3.0 rename (breaking):** this variant used to be `Node::Assign`
+    /// with `at: Expr` (a `Path`-wrapping `Expr`). It now matches the
+    /// canonical `flow.ir` schema's `let` node: the wire tag is `"let"` and
+    /// `at` is a bare [`Path`], serialized as a plain path string
+    /// (`"ctx.foo"`) rather than a `Path` `Expr` object. The canonical
+    /// write-side prefix is `ctx.`; the parser accepts both `$` and `ctx`
+    /// (root-token distinction is delegated to the caller — see [`Path`]).
+    Let {
+        /// [`Path`] the evaluated `value` is written to.
+        at: Path,
         /// `Expr` evaluated against the ctx snapshot.
         value: Expr,
     },
@@ -700,10 +710,10 @@ pub fn eval_with_storage_externs<D: Dispatcher>(
                 }
             }
         }
-        Node::Assign { at, value } => {
+        Node::Let { at, value } => {
             let snap = ctx.snapshot();
             let v = eval_expr_with_externs(value, &snap, externs)?;
-            ctx.write(&path_of(at)?.to_string(), v)
+            ctx.write(&at.to_string(), v)
         }
     }
 }

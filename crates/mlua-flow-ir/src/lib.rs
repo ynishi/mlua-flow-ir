@@ -24,7 +24,7 @@
 //!
 //! Sync (`flow_ir_core::eval_with_storage_externs`) and async
 //! (`eval_async_with_storage_externs`) share identical per-`Node` logic for
-//! `Step` / `Seq` / `Branch` / `Loop` / `Try` / `Assign`, and for
+//! `Step` / `Seq` / `Branch` / `Loop` / `Try` / `Let`, and for
 //! `JoinMode::All`. Two `Fanout` modes are **intentionally** divergent:
 //! `Race` — sync evaluates only `items[0]`; async races every branch and the
 //! first branch to *complete* wins, so an early error can win over a later
@@ -190,10 +190,10 @@ where
                 }
             }
         }
-        Node::Assign { at, value } => {
+        Node::Let { at, value } => {
             let snap = ctx.snapshot();
             let v = eval_expr_with_externs(value, &snap, externs)?;
-            ctx.write(&path_of_async(at)?.to_string(), v)
+            ctx.write(&at.to_string(), v)
         }
     }
 }
@@ -497,8 +497,8 @@ impl<'a> flow_ir_core::Externs for LuaExterns<'a> {
 ///
 /// -- call_extern: whitelist pure Lua fns via the externs table
 /// local node2 = {
-///   kind = "assign",
-///   at = { op = "path", at = "$.root" },
+///   kind = "let",
+///   at = "ctx.root",
 ///   value = { op = "call_extern", ref = "math.sqrt",
 ///             args = { { op = "path", at = "$.n" } } },
 /// }

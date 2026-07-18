@@ -18,6 +18,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Security
 
+## [0.3.0] — 2026-07-18
+
+### Changed
+
+- **Breaking (Node kind rename)** — `Node::Assign` is now `Node::Let`, matching the canonical `flow-ir-lua` schema (`flow/ir/schema.lua` `§Node.let`). The wire tag changes from `"assign"` to `"let"`, and the `at` field is downgraded from `Expr` (a `Path`-wrapping `Expr::Path`) to a bare `Path`, serialized as a plain path string. Wire format before: `{"kind": "assign", "at": {"op": "path", "at": "$.foo"}, "value": ...}` → after: `{"kind": "let", "at": "ctx.foo", "value": ...}`. Rust API: `Node::Assign { at: Expr, value: Expr }` → `Node::Let { at: Path, value: Expr }`. The v0.2.x `"kind": "assign"` tag is no longer accepted and the nested-`Expr` `at` shape is rejected at deserialize time.
+- **Breaking (`Path` parser root-token whitelist)** — the parser now accepts both `$` (canonical read prefix) and `ctx` (canonical write prefix, used by `Node::Let.at`) as leading root tokens. Bracket forms (`ctx.a["p.md"]` / `ctx["x.y"]`) work identically for either root. Root-token distinction (read vs. write) is delegated to the caller (the surrounding `Node` field contract) rather than encoded in the parser. The v0.2.0 typo-suspender rejections are preserved: `$foo`, `ctxfoo`, `foo.bar`, empty segments, malformed brackets are all still rejected up front. `Path`'s `Display` impl round-trips the original root token verbatim.
+- **Breaking (MSRV)** — `rust-version` bumped from `1.77` to `1.85`. Required by the transitive `lua-src v550.0.0` dependency (pulled in via `mlua`'s `vendored` feature), which requires `edition2024` (Cargo ≥ `1.85`). The v0.2.0 CI `msrv (1.77)` job failed on `main` after `lua-src` released `v550.0.0`; the CI job is now `msrv (1.85)` and green.
+
 ## [0.2.0] — 2026-07-11
 
 ### Added

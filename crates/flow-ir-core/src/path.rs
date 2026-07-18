@@ -1,24 +1,33 @@
 //! Typed context path (`Path`) — parsed, validated IR for the `$.a.b` /
-//! RFC 9535-style bracket path syntax used throughout flow.ir
-//! (`Expr::Path.at`, `Node::Fanout.bind`/`.out`, `Node::Assign.at`,
+//! `ctx.a.b` / RFC 9535-style bracket path syntax used throughout flow.ir
+//! (`Expr::Path.at`, `Node::Fanout.bind`/`.out`, `Node::Let.at`,
 //! `Node::Try.err_at`'s inner `Expr::Path`, ...).
 //!
 //! `Path` is the single authority for path syntax: parsing happens exactly
 //! once, at [`FromStr`]/[`Deserialize`] time (parse-don't-validate). `Node`
 //! / `Expr` fields carrying a path store an already-parsed `Path`, so
-//! evaluation (`read`/`write`) walks the same `Vec<Segment>` without ever
+//! evaluation (`read`/`write`) walks the same segment list without ever
 //! re-parsing a string.
 //!
 //! # Syntax
 //!
-//! - `$` — root path (empty segment list); [`Path::read`] returns the whole
-//!   ctx, [`Path::write`] replaces it wholesale.
-//! - `$.a.b.c` — dot-separated object-key segments.
-//! - `$.a["p.md"]` / `$["x.y"]` — RFC 9535 (JSONPath) style bracket segments
-//!   for keys containing a literal `.` (double-quoted, no escape support —
-//!   a key containing `"` cannot be represented in bracket form). Bracket
-//!   segments may chain directly (`$.a["x"]["y"]`) or be followed by a dot
-//!   segment (`$["x.y"].inner`).
+//! Every path starts with a **root token** (`$` or `ctx`) followed
+//! immediately by `.`, `[`, or end-of-string. Both root tokens are accepted
+//! by the parser; the distinction between them (read vs. write) is delegated
+//! to the caller (the surrounding `Node` field contract) rather than
+//! encoded here — e.g. `Node::Let.at` uses `ctx.`, while `Expr::Path.at`
+//! (read paths) continues to use `$.`. The [`Display`] impl round-trips the
+//! original root token verbatim, so `Path::from_str(path.to_string())`
+//! always yields an equal `Path`.
+//!
+//! - `$` / `ctx` — root path (empty segment list); [`Path::read`] returns the
+//!   whole ctx, [`Path::write`] replaces it wholesale.
+//! - `$.a.b.c` / `ctx.a.b.c` — dot-separated object-key segments.
+//! - `$.a["p.md"]` / `$["x.y"]` / `ctx.a["p.md"]` / `ctx["x.y"]` — RFC 9535
+//!   (JSONPath) style bracket segments for keys containing a literal `.`
+//!   (double-quoted, no escape support — a key containing `"` cannot be
+//!   represented in bracket form). Bracket segments may chain directly
+//!   (`$.a["x"]["y"]`) or be followed by a dot segment (`$["x.y"].inner`).
 //!
 //! No array-index support (MVP scope, unchanged from the pre-`Path` parser).
 //!
@@ -27,16 +36,18 @@
 //! wrappers, or as a deserialize error when a `Path` field is parsed from
 //! JSON)
 //!
-//! - anything not starting with `$` followed immediately by `.`, `[`, or
-//!   end-of-string — so `$foo` is rejected (it used to be silently accepted
-//!   as a 1-segment dot path: `"$foo".strip_prefix("$.")` fails, and the old
-//!   parser's `strip_prefix('$')` fallback let it through).
-//! - any empty dot segment: `$.`, `$.a.`, `$.a..b` — the old write-side
-//!   parser silently *dropped* empty segments (`.filter(|s| !s.is_empty())`)
-//!   while the old read-side parser only failed if the ctx happened to have
-//!   no key `""` at that position (`EvalError::PathNotFound`, not
-//!   `EvalError::InvalidPath`) — both were symptoms of the same missing
-//!   parse-time check, and both are now rejected uniformly, up front.
+//! - anything not starting with `$` or `ctx` followed immediately by `.`,
+//!   `[`, or end-of-string — so `$foo`, `ctxfoo`, and `foo.bar` are all
+//!   rejected. `$foo` was silently accepted in the pre-v0.2 parser; `ctxfoo`
+//!   / `foo.bar` are new rejections that keep the v0.2.0 typo-suspender
+//!   behavior consistent across the enlarged root-token whitelist.
+//! - any empty dot segment: `$.`, `$.a.`, `$.a..b`, `ctx.`, `ctx.a.`, ... —
+//!   the pre-v0.2 write-side parser silently *dropped* empty segments
+//!   (`.filter(|s| !s.is_empty())`) while the read-side parser only failed
+//!   if the ctx happened to have no key `""` at that position
+//!   (`EvalError::PathNotFound`, not `EvalError::InvalidPath`) — both were
+//!   symptoms of the same missing parse-time check, and both are now
+//!   rejected uniformly, up front.
 //! - the existing bracket-notation rejections (unterminated bracket, missing
 //!   `"` after `[`, empty key, empty `[""]`, a bracket segment directly
 //!   followed by an unseparated plain segment).
@@ -50,6 +61,29 @@ use thiserror::Error;
 
 use crate::EvalError;
 
+/// Root token of a parsed [`Path`] — either `$` (canonical read prefix) or
+/// `ctx` (canonical write prefix, e.g. `Node::Let.at`). The parser accepts
+/// both interchangeably; the surrounding `Node` field contract decides
+/// which is meaningful for a given position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Root {
+    /// `$` — canonical read-path root token (`Expr::Path.at` and every other
+    /// read position).
+    Dollar,
+    /// `ctx` — canonical write-path root token (`Node::Let.at` per the
+    /// canonical `flow.ir` schema).
+    Ctx,
+}
+
+impl Root {
+    fn as_str(self) -> &'static str {
+        match self {
+            Root::Dollar => "$",
+            Root::Ctx => "ctx",
+        }
+    }
+}
+
 /// One resolved path segment. Currently only object-key segments are
 /// supported; the variant is kept non-exhaustive-in-spirit (private, single
 /// arm) so a future `Index(usize)` (array-index support) is a pure addition.
@@ -61,9 +95,10 @@ enum Segment {
 }
 
 /// A parsed, validated context path — the canonical IR for the flow.ir
-/// `$.a.b` / RFC 9535-style bracket path syntax. The full syntax and
-/// rejection rules are documented on [`Path::read`] / [`Path::write`] and
-/// the `FromStr` implementation below.
+/// `$.a.b` / `ctx.a.b` / RFC 9535-style bracket path syntax. The full
+/// syntax and rejection rules are documented on the module-level docs and
+/// on [`Path::read`] / [`Path::write`] and the `FromStr` implementation
+/// below.
 ///
 /// Illegal path syntax cannot be represented by this type: the only way to
 /// construct a `Path` is [`FromStr::from_str`] (equivalently `str::parse`)
@@ -71,7 +106,10 @@ enum Segment {
 /// you hold a `Path`, [`Path::read`] / [`Path::write`] never re-derive or
 /// re-validate the segment list.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Path(Vec<Segment>);
+pub struct Path {
+    root: Root,
+    segments: Vec<Segment>,
+}
 
 /// Error returned by [`Path::from_str`] (and therefore surfaced through
 /// `Path`'s [`Deserialize`] impl, and through the `read_path` / `write_path`
@@ -94,16 +132,57 @@ impl PathParseError {
     }
 }
 
+/// Try to strip the root token (`$` or `ctx`) off the head of `path`.
+///
+/// Returns `(Root, rest)` on success. `rest` is either empty or begins with
+/// `.` or `[` — a bare continuation such as `$foo` / `ctxfoo` is rejected
+/// here (before the segment parser ever sees the body), consistent with the
+/// v0.2.0 typo-suspender behavior.
+fn strip_root(path: &str) -> Result<(Root, &str), PathParseError> {
+    // Try `ctx` first (longer prefix) so that `ctx...` never gets
+    // partially matched as `$`-less garbage.
+    if let Some(rest) = path.strip_prefix("ctx") {
+        if !accepts_after_root(rest) {
+            return Err(PathParseError::new(
+                path,
+                "expected '.', '[', or end-of-string right after 'ctx'",
+            ));
+        }
+        return Ok((Root::Ctx, rest));
+    }
+    if let Some(rest) = path.strip_prefix('$') {
+        if !accepts_after_root(rest) {
+            return Err(PathParseError::new(
+                path,
+                "expected '.', '[', or end-of-string right after '$'",
+            ));
+        }
+        return Ok((Root::Dollar, rest));
+    }
+    Err(PathParseError::new(
+        path,
+        "path must start with '$' or 'ctx' followed by '.', '[', or end-of-string",
+    ))
+}
+
+/// After stripping the root token, only `.`, `[`, or EOF may follow —
+/// anything else (a bare letter, digit, etc.) means the leading segment is
+/// glued to the root token and the parser rejects it as ambiguous.
+fn accepts_after_root(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with('.') || rest.starts_with('[')
+}
+
 impl FromStr for Path {
     type Err = PathParseError;
 
     fn from_str(path: &str) -> Result<Self, Self::Err> {
-        let rest = path
-            .strip_prefix('$')
-            .ok_or_else(|| PathParseError::new(path, "path must start with '$'"))?;
+        let (root, rest) = strip_root(path)?;
         if rest.is_empty() {
-            // Bare `$` — root path, no segments.
-            return Ok(Path(Vec::new()));
+            // Bare `$` / `ctx` — root path, no segments.
+            return Ok(Path {
+                root,
+                segments: Vec::new(),
+            });
         }
         let body = match rest.as_bytes()[0] {
             b'.' => {
@@ -117,24 +196,24 @@ impl FromStr for Path {
                 after_dot
             }
             b'[' => rest,
-            _ => {
-                return Err(PathParseError::new(
-                    path,
-                    "expected '.', '[', or end-of-string right after '$'",
-                ))
-            }
+            // strip_root's accepts_after_root check guarantees the head of
+            // `rest` is `.`, `[`, or empty — anything else was rejected there.
+            _ => unreachable!("strip_root guarantees the head byte here"),
         };
         let segments = if body.contains('[') {
             parse_bracket_segments(body, path)?
         } else {
             parse_dot_segments(body, path)?
         };
-        Ok(Path(segments.into_iter().map(Segment::Key).collect()))
+        Ok(Path {
+            root,
+            segments: segments.into_iter().map(Segment::Key).collect(),
+        })
     }
 }
 
-/// Split a (already `$`/`$.`-stripped) bracket-free body on `.`, rejecting
-/// any empty segment (leading/trailing/consecutive dots).
+/// Split a (already root-stripped) bracket-free body on `.`, rejecting any
+/// empty segment (leading/trailing/consecutive dots).
 fn parse_dot_segments(body: &str, original: &str) -> Result<Vec<String>, PathParseError> {
     let mut segments = Vec::new();
     for part in body.split('.') {
@@ -149,7 +228,7 @@ fn parse_dot_segments(body: &str, original: &str) -> Result<Vec<String>, PathPar
     Ok(segments)
 }
 
-/// Parse a (`$`/`$.`-stripped) body containing at least one `[` into its
+/// Parse a (root-stripped) body containing at least one `[` into its
 /// object-key segments. Supports:
 ///
 /// - plain segment: any run of chars excluding `.` and `[`, non-empty.
@@ -249,16 +328,18 @@ fn is_dot_safe(key: &str) -> bool {
 }
 
 impl fmt::Display for Path {
-    /// Canonical string form: `$` + `.key` for each identifier-safe segment,
-    /// `["key"]` bracket form otherwise. `Path::from_str(path.to_string())`
-    /// always re-parses to an equal `Path` (round-trip law) — the canonical
-    /// form may normalize the *representation* (e.g. a segment reachable
-    /// only via dot form on the way in is still rendered via dot form; a
-    /// segment that required bracket form on the way in is rendered via
-    /// bracket form) without changing the parsed segment list.
+    /// Canonical string form: the original root token (`$` or `ctx`) +
+    /// `.key` for each identifier-safe segment, `["key"]` bracket form
+    /// otherwise. `Path::from_str(path.to_string())` always re-parses to an
+    /// equal `Path` (round-trip law, including root-token preservation) —
+    /// the canonical form may normalize each *segment*'s representation
+    /// (e.g. a segment reachable only via dot form on the way in is still
+    /// rendered via dot form; a segment that required bracket form on the
+    /// way in is rendered via bracket form) without changing the parsed
+    /// segment list.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "$")?;
-        for Segment::Key(key) in &self.0 {
+        f.write_str(self.root.as_str())?;
+        for Segment::Key(key) in &self.segments {
             if is_dot_safe(key) {
                 write!(f, ".{key}")?;
             } else {
@@ -291,13 +372,13 @@ impl<'de> Deserialize<'de> for Path {
 impl Path {
     /// Read the value this path resolves to inside `ctx`.
     ///
-    /// The root path (`$`) resolves to `ctx` itself. A missing key along the
-    /// way raises [`EvalError::PathNotFound`] — malformed *syntax* is
-    /// rejected earlier, at parse time, so `read` can never raise
-    /// [`EvalError::InvalidPath`].
+    /// The root path (`$` / `ctx` with no segments) resolves to `ctx`
+    /// itself. A missing key along the way raises
+    /// [`EvalError::PathNotFound`] — malformed *syntax* is rejected earlier,
+    /// at parse time, so `read` can never raise [`EvalError::InvalidPath`].
     pub fn read<'a>(&self, ctx: &'a Value) -> Result<&'a Value, EvalError> {
         let mut cur = ctx;
-        for Segment::Key(key) in &self.0 {
+        for Segment::Key(key) in &self.segments {
             cur = cur
                 .get(key)
                 .ok_or_else(|| EvalError::PathNotFound(self.to_string()))?;
@@ -308,24 +389,24 @@ impl Path {
     /// Write `value` at the location this path resolves to inside `ctx`,
     /// mutating `ctx` in place.
     ///
-    /// The root path (`$`) replaces `ctx` wholesale. Missing intermediate
-    /// objects along the way are created automatically (a `null` — or
-    /// altogether absent — intermediate promotes to an empty object, same
-    /// as before this type existed). If an intermediate segment already
-    /// holds a concrete non-object value (a string, number, bool, or
-    /// array), the write is rejected with [`EvalError::TypeError`] instead
-    /// of silently clobbering it; `ctx` is left byte-for-byte unmodified in
-    /// that case (a rejected write never partially applies, because every
-    /// intermediate object promotion this method performs only ever touches
-    /// a freshly-created — previously `null`/absent — subtree, which by
-    /// construction cannot itself contain a pre-existing conflicting value
-    /// further down).
+    /// The root path (`$` / `ctx` with no segments) replaces `ctx`
+    /// wholesale. Missing intermediate objects along the way are created
+    /// automatically (a `null` — or altogether absent — intermediate
+    /// promotes to an empty object, same as before this type existed). If
+    /// an intermediate segment already holds a concrete non-object value
+    /// (a string, number, bool, or array), the write is rejected with
+    /// [`EvalError::TypeError`] instead of silently clobbering it; `ctx` is
+    /// left byte-for-byte unmodified in that case (a rejected write never
+    /// partially applies, because every intermediate object promotion this
+    /// method performs only ever touches a freshly-created — previously
+    /// `null`/absent — subtree, which by construction cannot itself contain
+    /// a pre-existing conflicting value further down).
     pub fn write(&self, ctx: &mut Value, value: Value) -> Result<(), EvalError> {
-        if self.0.is_empty() {
+        if self.segments.is_empty() {
             *ctx = value;
             return Ok(());
         }
-        write_recursive(ctx, &self.0, value, self)
+        write_recursive(ctx, &self.segments, value, self)
     }
 }
 
@@ -375,31 +456,62 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn path_dollar(segments: Vec<&str>) -> Path {
+        Path {
+            root: Root::Dollar,
+            segments: segments
+                .into_iter()
+                .map(|s| Segment::Key(s.to_string()))
+                .collect(),
+        }
+    }
+
+    fn path_ctx(segments: Vec<&str>) -> Path {
+        Path {
+            root: Root::Ctx,
+            segments: segments
+                .into_iter()
+                .map(|s| Segment::Key(s.to_string()))
+                .collect(),
+        }
+    }
+
     // ── accept/reject table ────────────────────────────────────────────
 
     #[test]
-    fn accepts_root() {
+    fn accepts_root_dollar() {
         let p: Path = "$".parse().unwrap();
-        assert_eq!(p, Path(Vec::new()));
+        assert_eq!(p, path_dollar(vec![]));
     }
 
     #[test]
-    fn accepts_single_dot_segment() {
+    fn accepts_root_ctx() {
+        let p: Path = "ctx".parse().unwrap();
+        assert_eq!(p, path_ctx(vec![]));
+    }
+
+    #[test]
+    fn accepts_single_dot_segment_dollar() {
         let p: Path = "$.a".parse().unwrap();
-        assert_eq!(p, Path(vec![Segment::Key("a".into())]));
+        assert_eq!(p, path_dollar(vec!["a"]));
+    }
+
+    #[test]
+    fn accepts_single_dot_segment_ctx() {
+        let p: Path = "ctx.a".parse().unwrap();
+        assert_eq!(p, path_ctx(vec!["a"]));
     }
 
     #[test]
     fn accepts_multi_dot_segments() {
         let p: Path = "$.a.b".parse().unwrap();
-        assert_eq!(
-            p,
-            Path(vec![Segment::Key("a".into()), Segment::Key("b".into())])
-        );
+        assert_eq!(p, path_dollar(vec!["a", "b"]));
+        let q: Path = "ctx.a.b".parse().unwrap();
+        assert_eq!(q, path_ctx(vec!["a", "b"]));
     }
 
     #[test]
-    fn accepts_bracket_forms() {
+    fn accepts_bracket_forms_dollar() {
         assert!("$.a[\"p.md\"]".parse::<Path>().is_ok());
         assert!("$[\"x.y\"]".parse::<Path>().is_ok());
         assert!("$[\"x.y\"].inner".parse::<Path>().is_ok());
@@ -407,33 +519,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_dollar_prefix() {
+    fn accepts_bracket_forms_ctx() {
+        assert!("ctx.a[\"p.md\"]".parse::<Path>().is_ok());
+        assert!("ctx[\"x.y\"]".parse::<Path>().is_ok());
+        assert!("ctx[\"x.y\"].inner".parse::<Path>().is_ok());
+        assert!("ctx.a[\"x\"][\"y\"]".parse::<Path>().is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_root_token() {
         assert!("a.b".parse::<Path>().is_err());
         assert!("".parse::<Path>().is_err());
     }
 
     #[test]
     fn rejects_dollar_foo_no_dot() {
-        // previously silently accepted as a 1-segment dot path
+        // previously silently accepted as a 1-segment dot path (pre-v0.2)
         let err = "$foo".parse::<Path>().unwrap_err();
         assert_eq!(err.path, "$foo");
+    }
+
+    #[test]
+    fn rejects_ctxfoo_no_dot() {
+        // v0.3.0: `ctx` root token is now accepted, but a bare continuation
+        // (`ctxfoo`) is rejected on the same principle as `$foo`.
+        let err = "ctxfoo".parse::<Path>().unwrap_err();
+        assert_eq!(err.path, "ctxfoo");
+    }
+
+    #[test]
+    fn rejects_foo_bar_no_root() {
+        // Neither `$` nor `ctx` — should be rejected outright rather than
+        // reinterpreted as `$.foo.bar`.
+        assert!("foo.bar".parse::<Path>().is_err());
     }
 
     #[test]
     fn rejects_trailing_dot() {
         assert!("$.".parse::<Path>().is_err());
         assert!("$.a.".parse::<Path>().is_err());
+        assert!("ctx.".parse::<Path>().is_err());
+        assert!("ctx.a.".parse::<Path>().is_err());
     }
 
     #[test]
     fn rejects_empty_middle_segment() {
         assert!("$.a..b".parse::<Path>().is_err());
+        assert!("ctx.a..b".parse::<Path>().is_err());
     }
 
     #[test]
     fn rejects_empty_bracket_key() {
         assert!("$.a[\"\"]".parse::<Path>().is_err());
         assert!("$.a[]".parse::<Path>().is_err());
+        assert!("ctx.a[\"\"]".parse::<Path>().is_err());
     }
 
     #[test]
@@ -464,6 +603,11 @@ mod tests {
             "$[\"x.y\"]",
             "$[\"x.y\"].inner",
             "$.a[\"x\"][\"y\"]",
+            "ctx",
+            "ctx.a",
+            "ctx.a.b.c",
+            "ctx.a[\"p.md\"]",
+            "ctx[\"x.y\"]",
         ] {
             let parsed: Path = src.parse().unwrap();
             let rendered = parsed.to_string();
@@ -478,15 +622,19 @@ mod tests {
     }
 
     #[test]
-    fn display_dot_safe_key_renders_dot_form() {
+    fn display_preserves_root_token() {
         let p: Path = "$.a".parse().unwrap();
         assert_eq!(p.to_string(), "$.a");
+        let q: Path = "ctx.a".parse().unwrap();
+        assert_eq!(q.to_string(), "ctx.a");
     }
 
     #[test]
     fn display_dotted_key_renders_bracket_form() {
         let p: Path = "$.a[\"p.md\"]".parse().unwrap();
         assert_eq!(p.to_string(), "$.a[\"p.md\"]");
+        let q: Path = "ctx.a[\"p.md\"]".parse().unwrap();
+        assert_eq!(q.to_string(), "ctx.a[\"p.md\"]");
     }
 
     // ── read / write ────────────────────────────────────────────────────
@@ -496,6 +644,11 @@ mod tests {
         let p: Path = "$".parse().unwrap();
         let ctx = json!({"a": 1});
         assert_eq!(p.read(&ctx).unwrap(), &ctx);
+        // `ctx` root token behaves identically as a *reader* (root-token
+        // meaning is delegated to the surrounding Node contract, not the
+        // parser).
+        let q: Path = "ctx".parse().unwrap();
+        assert_eq!(q.read(&ctx).unwrap(), &ctx);
     }
 
     #[test]
@@ -512,6 +665,17 @@ mod tests {
         let mut ctx = json!({"a": 1});
         p.write(&mut ctx, json!({"b": 2})).unwrap();
         assert_eq!(ctx, json!({"b": 2}));
+    }
+
+    #[test]
+    fn write_ctx_prefix_is_symmetric() {
+        // `ctx.foo` writes the same way `$.foo` does — the write path
+        // primitive is agnostic to the root token, only the segment list
+        // matters.
+        let p: Path = "ctx.a.b".parse().unwrap();
+        let mut ctx = json!({});
+        p.write(&mut ctx, json!(1)).unwrap();
+        assert_eq!(ctx, json!({"a": {"b": 1}}));
     }
 
     #[test]

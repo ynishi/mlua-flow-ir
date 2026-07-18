@@ -232,8 +232,7 @@ fn lua_eval_call_extern_resolves_lua_fn() {
         .load(
             r#"
         local node = {
-            kind = "assign",
-            at = { op = "path", at = "$.score" },
+            kind = "let", at = "ctx.score",
             value = {
                 op = "call_extern", ref = "ucb.bonus",
                 args = {
@@ -269,8 +268,7 @@ fn lua_eval_call_extern_unregistered_errors() {
         .load(
             r#"
         local node = {
-            kind = "assign",
-            at = { op = "path", at = "$.x" },
+            kind = "let", at = "ctx.x",
             value = { op = "call_extern", ref = "nope", args = {} },
         }
         local function dispatcher(_r, _i) end
@@ -289,8 +287,7 @@ fn lua_eval_call_extern_without_externs_table_errors() {
         .load(
             r#"
         local node = {
-            kind = "assign",
-            at = { op = "path", at = "$.x" },
+            kind = "let", at = "ctx.x",
             value = { op = "call_extern", ref = "f", args = {} },
         }
         local function dispatcher(_r, _i) end
@@ -321,13 +318,11 @@ fn lua_eval_gte_lte_wire_tags() {
                 },
             },
             ["then"] = {
-                kind = "assign",
-                at = { op = "path", at = "$.r" },
+                kind = "let", at = "ctx.r",
                 value = { op = "lit", value = "ok" },
             },
             ["else"] = {
-                kind = "assign",
-                at = { op = "path", at = "$.r" },
+                kind = "let", at = "ctx.r",
                 value = { op = "lit", value = "ng" },
             },
         }

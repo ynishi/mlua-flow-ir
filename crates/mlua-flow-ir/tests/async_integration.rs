@@ -246,10 +246,8 @@ async fn eval_async_call_extern_with_extern_map() {
         Ok(json!(x.sqrt()))
     });
 
-    let n = Node::Assign {
-        at: Expr::Path {
-            at: "$.root".parse().unwrap(),
-        },
+    let n = Node::Let {
+        at: "ctx.root".parse().unwrap(),
         value: Expr::CallExtern {
             ref_: "math.sqrt".into(),
             args: vec![Expr::Path {
@@ -267,10 +265,8 @@ async fn eval_async_call_extern_with_extern_map() {
 
 #[tokio::test]
 async fn eval_async_call_extern_without_externs_errors() {
-    let n = Node::Assign {
-        at: Expr::Path {
-            at: "$.x".parse().unwrap(),
-        },
+    let n = Node::Let {
+        at: "ctx.x".parse().unwrap(),
         value: Expr::CallExtern {
             ref_: "f".into(),
             args: vec![],

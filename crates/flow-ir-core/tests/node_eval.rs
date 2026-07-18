@@ -1,5 +1,5 @@
 //! Node-level semantics coverage (Step / Seq / Branch / Fanout / Loop / Try /
-//! Assign) plus serde wire-format robustness (unknown-field handling,
+//! Let) plus serde wire-format robustness (unknown-field handling,
 //! round-trip stability, rename survival). `expr_ops.rs` covers `Expr` ops
 //! only; this file is the Node-kind counterpart plus schema hardening.
 
@@ -64,8 +64,8 @@ fn seq_children_execute_in_order_and_see_earlier_writes() {
     let node: Node = serde_json::from_value(json!({
         "kind": "seq",
         "children": [
-            {"kind":"assign","at":{"op":"path","at":"$.a"},"value":{"op":"lit","value":1}},
-            {"kind":"assign","at":{"op":"path","at":"$.b"},
+            {"kind": "let", "at": "ctx.a","value":{"op":"lit","value":1}},
+            {"kind": "let", "at": "ctx.b",
              "value":{"op":"add","lhs":{"op":"path","at":"$.a"},"rhs":{"op":"lit","value":1}}}
         ]
     }))
@@ -90,8 +90,8 @@ fn branch_node(cond_value: Value) -> Node {
     serde_json::from_value(json!({
         "kind": "branch",
         "cond": {"op": "lit", "value": cond_value},
-        "then": {"kind":"assign","at":{"op":"path","at":"$.r"},"value":{"op":"lit","value":"then"}},
-        "else": {"kind":"assign","at":{"op":"path","at":"$.r"},"value":{"op":"lit","value":"else"}}
+        "then": {"kind": "let", "at": "ctx.r","value":{"op":"lit","value":"then"}},
+        "else": {"kind": "let", "at": "ctx.r","value":{"op":"lit","value":"else"}}
     }))
     .unwrap()
 }
@@ -125,8 +125,7 @@ fn fanout_node(join: &str, items: Value) -> Node {
         join,
         items,
         json!({
-            "kind": "assign",
-            "at": {"op": "path", "at": "$.doubled"},
+            "kind": "let", "at": "ctx.doubled",
             "value": {"op": "mul", "lhs": {"op": "path", "at": "$.item"}, "rhs": {"op": "lit", "value": 10}}
         }),
     )
@@ -151,7 +150,7 @@ fn branchy_body_json() -> Value {
         "kind": "branch",
         "cond": {"op": "eq", "lhs": {"op": "path", "at": "$.item"}, "rhs": {"op": "lit", "value": 2}},
         "then": {"kind": "step", "ref": "boom", "in": {"op": "lit", "value": null}, "out": {"op": "path", "at": "$.out"}},
-        "else": {"kind": "assign", "at": {"op": "path", "at": "$.out"}, "value": {"op": "lit", "value": "ok"}}
+        "else": {"kind": "let", "at": "ctx.out", "value": {"op": "lit", "value": "ok"}}
     })
 }
 
@@ -254,7 +253,7 @@ fn fanout_non_array_items_errors() {
     let node = fanout_with_body(
         "all",
         json!("not-an-array"),
-        json!({"kind": "assign", "at": {"op": "path", "at": "$.x"}, "value": {"op": "lit", "value": 1}}),
+        json!({"kind": "let", "at": "ctx.x", "value": {"op": "lit", "value": 1}}),
     );
     let err = eval(&node, json!({}), &FxDispatcher::new()).unwrap_err();
     assert!(
@@ -335,7 +334,7 @@ fn loop_ctx_writes_visible_across_iterations_and_cond_stops_the_loop() {
         "kind": "loop",
         "counter": {"op": "path", "at": "$.counter"},
         "cond": {"op": "lt", "lhs": {"op": "path", "at": "$.sum"}, "rhs": {"op": "lit", "value": 3}},
-        "body": {"kind": "assign", "at": {"op": "path", "at": "$.sum"},
+        "body": {"kind": "let", "at": "ctx.sum",
                  "value": {"op": "add", "lhs": {"op": "path", "at": "$.sum"}, "rhs": {"op": "lit", "value": 1}}},
         "max": 10
     }))
@@ -360,11 +359,11 @@ fn try_body_failure_rolls_back_ctx_to_pre_body_snapshot() {
         "body": {
             "kind": "seq",
             "children": [
-                {"kind": "assign", "at": {"op": "path", "at": "$.mark"}, "value": {"op": "lit", "value": "was-here"}},
+                {"kind": "let", "at": "ctx.mark", "value": {"op": "lit", "value": "was-here"}},
                 {"kind": "step", "ref": "boom", "in": {"op": "lit", "value": null}, "out": {"op": "path", "at": "$.out"}}
             ]
         },
-        "catch": {"kind": "assign", "at": {"op": "path", "at": "$.caught"}, "value": {"op": "lit", "value": true}}
+        "catch": {"kind": "let", "at": "ctx.caught", "value": {"op": "lit", "value": true}}
     }))
     .unwrap();
     let dispatcher = FxDispatcher::failing(&["boom"]);
@@ -381,7 +380,7 @@ fn try_err_at_writes_error_message_before_catch() {
     let node: Node = serde_json::from_value(json!({
         "kind": "try",
         "body": {"kind": "step", "ref": "boom", "in": {"op": "lit", "value": null}, "out": {"op": "path", "at": "$.out"}},
-        "catch": {"kind": "assign", "at": {"op": "path", "at": "$.caught"}, "value": {"op": "lit", "value": true}},
+        "catch": {"kind": "let", "at": "ctx.caught", "value": {"op": "lit", "value": true}},
         "err_at": {"op": "path", "at": "$.err"}
     }))
     .unwrap();
@@ -417,7 +416,7 @@ fn try_catch_raising_propagates() {
 fn try_body_success_catch_not_executed() {
     let node: Node = serde_json::from_value(json!({
         "kind": "try",
-        "body": {"kind": "assign", "at": {"op": "path", "at": "$.ok"}, "value": {"op": "lit", "value": true}},
+        "body": {"kind": "let", "at": "ctx.ok", "value": {"op": "lit", "value": true}},
         "catch": {"kind": "step", "ref": "should_not_run", "in": {"op": "lit", "value": null}, "out": {"op": "path", "at": "$.out"}}
     }))
     .unwrap();
@@ -428,19 +427,45 @@ fn try_body_success_catch_not_executed() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Assign
+// Let (v0.3.0 rename from Assign — see CHANGELOG)
 // ──────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn assign_writes_evaluated_expr_to_out_path() {
+fn let_writes_evaluated_expr_to_out_path() {
     let node: Node = serde_json::from_value(json!({
-        "kind": "assign",
-        "at": {"op": "path", "at": "$.out"},
+        "kind": "let", "at": "ctx.out",
         "value": {"op": "add", "lhs": {"op": "lit", "value": 1}, "rhs": {"op": "lit", "value": 2}}
     }))
     .unwrap();
     let out = eval(&node, json!({}), &FxDispatcher::new()).unwrap();
     assert_eq!(out, json!({"out": 3.0}));
+}
+
+#[test]
+fn let_accepts_bare_ctx_path_string_at() {
+    // Regression: the wire format for `Let.at` is a bare path string, not a
+    // `Path` `Expr` object (that was the pre-v0.3.0 shape for the old
+    // `Assign` variant). Rejects the legacy nested-Expr shape.
+    let bad = serde_json::from_value::<Node>(json!({
+        "kind": "let",
+        "at": {"op": "path", "at": "$.out"},
+        "value": {"op": "lit", "value": 1}
+    }));
+    assert!(bad.is_err(), "nested-Expr `at` must be rejected: {bad:?}");
+}
+
+#[test]
+fn let_rejects_legacy_assign_kind_tag() {
+    // Regression: the v0.2.x `"kind": "assign"` tag is no longer recognized.
+    let bad = serde_json::from_value::<Node>(json!({
+        "kind": "assign",
+        "at": {"op": "path", "at": "$.out"},
+        "value": {"op": "lit", "value": 1}
+    }));
+    assert!(
+        bad.is_err(),
+        "legacy `assign` kind must be rejected: {bad:?}"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -530,8 +555,8 @@ fn node_unknown_kind_tag_rejected() {
 fn try_absent_err_at_parses_as_none_and_serializes_explicit_null() {
     let node: Node = serde_json::from_value(json!({
         "kind": "try",
-        "body": {"kind": "assign", "at": {"op": "path", "at": "$.a"}, "value": {"op": "lit", "value": 1}},
-        "catch": {"kind": "assign", "at": {"op": "path", "at": "$.b"}, "value": {"op": "lit", "value": 2}}
+        "body": {"kind": "let", "at": "ctx.a", "value": {"op": "lit", "value": 1}},
+        "catch": {"kind": "let", "at": "ctx.b", "value": {"op": "lit", "value": 2}}
     }))
     .unwrap();
     match &node {
@@ -560,23 +585,23 @@ fn node_tree_full_roundtrip_all_kinds_stable_reserialization() {
                 {"kind": "step", "ref": "r1", "in": {"op": "path", "at": "$.in"}, "out": {"op": "path", "at": "$.out"}},
                 {"kind": "branch",
                  "cond": {"op": "eq", "lhs": {"op": "lit", "value": 1}, "rhs": {"op": "lit", "value": 1}},
-                 "then": {"kind": "assign", "at": {"op": "path", "at": "$.t"}, "value": {"op": "lit", "value": "y"}},
-                 "else": {"kind": "assign", "at": {"op": "path", "at": "$.t"}, "value": {"op": "lit", "value": "n"}}},
+                 "then": {"kind": "let", "at": "ctx.t", "value": {"op": "lit", "value": "y"}},
+                 "else": {"kind": "let", "at": "ctx.t", "value": {"op": "lit", "value": "n"}}},
                 {"kind": "fanout",
                  "items": {"op": "lit", "value": [1, 2]},
                  "bind": {"op": "path", "at": "$.item"},
-                 "body": {"kind": "assign", "at": {"op": "path", "at": "$.doubled"},
+                 "body": {"kind": "let", "at": "ctx.doubled",
                           "value": {"op": "mul", "lhs": {"op": "path", "at": "$.item"}, "rhs": {"op": "lit", "value": 2}}},
                  "join": "all",
                  "out": {"op": "path", "at": "$.results"}},
                 {"kind": "loop",
                  "counter": {"op": "path", "at": "$.c"},
                  "cond": {"op": "call_extern", "ref": "is_done", "args": [{"op": "path", "at": "$.x"}]},
-                 "body": {"kind": "assign", "at": {"op": "path", "at": "$.x"}, "value": {"op": "lit", "value": 1}},
+                 "body": {"kind": "let", "at": "ctx.x", "value": {"op": "lit", "value": 1}},
                  "max": 1}
             ]
         },
-        "catch": {"kind": "assign", "at": {"op": "path", "at": "$.caught"}, "value": {"op": "lit", "value": true}},
+        "catch": {"kind": "let", "at": "ctx.caught", "value": {"op": "lit", "value": true}},
         "err_at": {"op": "path", "at": "$.err"}
     });
 
@@ -599,9 +624,9 @@ fn node_tree_full_roundtrip_all_kinds_stable_reserialization() {
 
     // Branch: then_ -> "then", else_ -> "else" survive the round-trip.
     let branch = &reserialized["body"]["children"][1];
-    assert_eq!(branch["then"]["kind"], json!("assign"));
+    assert_eq!(branch["then"]["kind"], json!("let"));
     assert!(branch.get("then_").is_none());
-    assert_eq!(branch["else"]["kind"], json!("assign"));
+    assert_eq!(branch["else"]["kind"], json!("let"));
     assert!(branch.get("else_").is_none());
 
     // CallExtern (nested in Loop.cond): ref_ -> "ref" survives too.

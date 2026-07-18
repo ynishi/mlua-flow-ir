@@ -13,7 +13,7 @@ Host-side concerns (Spawner / Worker / Loop / AuthzPolicy / cp_state persist) li
 
 ## Design
 
-- **7 Node kinds** — `Step { ref, in, out }`, `Seq { children }`, `Branch { cond, then, else }`, `Fanout { items, bind, body, join, out }`, `Loop { counter, cond, body, max }`, `Try { body, catch, err_at }`, `Assign { at, value }`
+- **7 Node kinds** — `Step { ref, in, out }`, `Seq { children }`, `Branch { cond, then, else }`, `Fanout { items, bind, body, join, out }`, `Loop { counter, cond, body, max }`, `Try { body, catch, err_at }`, `Let { at, value }` (canonical `let` — see the v0.3.0 [Migration](#migration-v030) note for the rename from `Assign`)
 - **20 Expr ops** — read/literal (`Path`, `Lit`), comparison (`Eq`, `Ne`, `Lt`, `Lte`, `Gt`, `Gte`), boolean (`Not`, `And`, `Or`), existence (`Exists`), arithmetic (`Add`, `Sub`, `Mul`, `Div`, `Mod`), aggregate (`Len`, `In`), and the `CallExtern` hatch
 - **Discriminated** — `#[serde(tag = "kind")]` / `#[serde(tag = "op")]` + `deny_unknown_fields`
 - **Dispatcher = callback** — host provides concrete implementations (process spawn, mlua callback, MCP call, direct LLM, etc.)
@@ -50,8 +50,38 @@ assert_eq!(result, json!({ "input": "hello", "output": "HELLO" }));
 
 - **v0.0.1–0.0.3** — pre-split prototype (single crate)
 - **v0.0.4** — workspace split: `flow-ir-core` (Pure Rust) + `mlua-flow-ir` (async + mlua)
-- **v0.1.x** (current) — `Expr::CallExtern` hatch + `Externs` DI registry, `Expr::Mod`, canonical wire-format alignment (`gte`/`lte`, `args`/`arg`), `Node::Loop` / `Node::Try` / `Node::Assign`, RFC 9535-style bracket path notation. See [CHANGELOG.md](CHANGELOG.md) for the full per-release list.
+- **v0.1.x** — `Expr::CallExtern` hatch + `Externs` DI registry, `Expr::Mod`, canonical wire-format alignment (`gte`/`lte`, `args`/`arg`), `Node::Loop` / `Node::Try` / `Node::Assign`, RFC 9535-style bracket path notation
+- **v0.2.0** — typed [`Path`] IR (parse-don't-validate), `EvalError::TypeError` / `ArithError`, `mlua` feature passthrough (`lua51`/`lua52`/`lua53`/`lua54`/`luajit`/`luau` + weak `vendored`), CI gates
+- **v0.3.0** (current) — canonical wire-format alignment: `Node::Assign` → `Node::Let` (canonical `let`), `Path` parser root-token whitelist expansion (`ctx` / `ctx.foo` / `ctx["foo"]` accepted alongside `$` — see [Migration](#migration-v030) below), MSRV bump `1.77` → `1.85` (`lua-src v550.0.0` `edition2024` requirement)
 - **Future** — JSON / YAML loader split into `mlua-flow-json` / `mlua-flow-yaml` sibling crates; engine integration via `mlua-swarm-engine` (Spawner / Worker / Loop / AuthzPolicy)
+
+See [CHANGELOG.md](CHANGELOG.md) for the full per-release list.
+
+## Migration (v0.3.0)
+
+Three breaking changes are bundled into `v0.3.0` so downstream consumers migrate in a single hop:
+
+1. **`Node::Assign` → `Node::Let`.** The wire tag is `"let"` (was `"assign"`) and `at` is now a bare [`Path`] string rather than a `Path` `Expr` object.
+
+   ```json
+   // v0.2.x
+   { "kind": "assign", "at": { "op": "path", "at": "$.foo" }, "value": ... }
+   // v0.3.0
+   { "kind": "let", "at": "ctx.foo", "value": ... }
+   ```
+
+   Rust API:
+
+   ```rust
+   // v0.2.x
+   Node::Assign { at: Expr, value: Expr }
+   // v0.3.0
+   Node::Let { at: Path, value: Expr }
+   ```
+
+2. **`Path` parser root-token whitelist expanded.** Both `$` (read prefix) and `ctx` (write prefix, canonical) are now accepted by the parser; the distinction between them is delegated to the caller (the surrounding `Node` field contract) — read paths continue to use `$`, while `Node::Let.at` uses `ctx.`. The v0.2.0 typo-suspender rejections (`$foo` / `ctxfoo` / `foo.bar`, empty segments, malformed brackets) are preserved.
+
+3. **MSRV bump `1.77` → `1.85`.** Required by the transitive `lua-src v550.0.0` dependency (pulled in via `mlua`'s `vendored` feature), which requires `edition2024`. Downstream consumers with an MSRV floor below `1.85` will need to bump their toolchain.
 
 ## Publish order
 
