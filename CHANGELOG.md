@@ -8,8 +8,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
-- `[package.metadata.docs.rs]` section on both crates. `flow-ir-core` uses `all-features = true`; `mlua-flow-ir` pins `features = ["lua54", "vendored"]` (mlua's Lua-version features are mutually exclusive at build time, so `all-features = true` would fail). Both add `rustdoc-args = ["--cfg", "docsrs"]` and target `x86_64-unknown-linux-gnu` so docs.rs builds are explicit and reproducible instead of relying on cargo default-feature inference.
-
 ### Changed
 
 ### Deprecated
@@ -18,9 +16,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 
-- Stale `Assign { at, value }` references in per-crate `README.md` and in three comment lines of `crates/mlua-flow-ir/tests/dynamic_injection.rs` (missed during the v0.3.0 rename sweep — the root `README.md` and rustdoc were updated at that time, the per-crate `README.md` and Japanese test comments were not).
-
 ### Security
+
+## [0.3.1] — 2026-07-18
+
+### Added
+
+- `[package.metadata.docs.rs]` section on both crates. `flow-ir-core` uses `all-features = true`; `mlua-flow-ir` pins `features = ["lua54", "vendored"]` (mlua's Lua-version features are mutually exclusive at build time, so `all-features = true` would fail). Both add `rustdoc-args = ["--cfg", "docsrs"]` and target `x86_64-unknown-linux-gnu` so docs.rs builds are explicit and reproducible instead of relying on cargo default-feature inference.
+
+### Fixed
+
+- Stale `Assign { at, value }` references in per-crate `README.md` and in three comment lines of `crates/mlua-flow-ir/tests/dynamic_injection.rs` (missed during the v0.3.0 rename sweep — the root `README.md` and rustdoc were updated at that time, the per-crate `README.md` and Japanese test comments were not).
 
 ## [0.3.0] — 2026-07-18
 
