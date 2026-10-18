@@ -10,9 +10,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Changed
 
-- **Breaking (dependency)** — `mlua-flow-ir` now depends on `mlua ^0.12` (was `^0.11`). `mlua` declares `links = "lua"`, so a build graph can hold only one `mlua` version; this lets `mlua-flow-ir` coexist with crates already on `mlua ^0.12` (e.g. `agent-block-core` 0.42). No source change was needed. Downstream crates that still depend on `mlua ^0.11` must move to `^0.12` as well (#3).
-- **Breaking (MSRV)** — `rust-version` bumped from `1.85` to `1.88`. Required by `mlua` 0.12.x, which declares `rust-version = "1.88"`. The CI job is now `msrv (1.88)`.
-
 ### Deprecated
 
 ### Removed
@@ -20,6 +17,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ### Fixed
 
 ### Security
+
+## [0.4.0] — 2026-10-18
+
+### Changed
+
+- **Breaking (dependency)** — `mlua-flow-ir` now depends on `mlua ^0.12` (was `^0.11`). `mlua` declares `links = "lua"`, so a build graph can hold only one `mlua` version; this lets `mlua-flow-ir` coexist with crates already on `mlua ^0.12` (e.g. `agent-block-core` 0.42). No source change was needed. Downstream crates that still depend on `mlua ^0.11` must move to `^0.12` as well (#3).
+- **Breaking (MSRV)** — `rust-version` bumped from `1.85` to `1.88`. Required by `mlua` 0.12.x, which declares `rust-version = "1.88"`. The CI job is now `msrv (1.88)`.
 
 ## [0.3.1] — 2026-07-18
 

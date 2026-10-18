@@ -52,7 +52,8 @@ assert_eq!(result, json!({ "input": "hello", "output": "HELLO" }));
 - **v0.0.4** — workspace split: `flow-ir-core` (Pure Rust) + `mlua-flow-ir` (async + mlua)
 - **v0.1.x** — `Expr::CallExtern` hatch + `Externs` DI registry, `Expr::Mod`, canonical wire-format alignment (`gte`/`lte`, `args`/`arg`), `Node::Loop` / `Node::Try` / `Node::Assign`, RFC 9535-style bracket path notation
 - **v0.2.0** — typed [`Path`] IR (parse-don't-validate), `EvalError::TypeError` / `ArithError`, `mlua` feature passthrough (`lua51`/`lua52`/`lua53`/`lua54`/`luajit`/`luau` + weak `vendored`), CI gates
-- **v0.3.0** (current) — canonical wire-format alignment: `Node::Assign` → `Node::Let` (canonical `let`), `Path` parser root-token whitelist expansion (`ctx` / `ctx.foo` / `ctx["foo"]` accepted alongside `$` — see [Migration](#migration-v030) below), MSRV bump `1.77` → `1.85` (`lua-src v550.0.0` `edition2024` requirement)
+- **v0.3.0** — canonical wire-format alignment: `Node::Assign` → `Node::Let` (canonical `let`), `Path` parser root-token whitelist expansion (`ctx` / `ctx.foo` / `ctx["foo"]` accepted alongside `$` — see [Migration](#migration-v030) below), MSRV bump `1.77` → `1.85` (`lua-src v550.0.0` `edition2024` requirement)
+- **v0.4.0** (current) — `mlua` `^0.11` → `^0.12` (coexists with other `mlua ^0.12` crates in one build graph), MSRV bump `1.85` → `1.88` (`mlua` 0.12.x requirement)
 - **Future** — JSON / YAML loader split into `mlua-flow-json` / `mlua-flow-yaml` sibling crates; engine integration via `mlua-swarm-engine` (Spawner / Worker / Loop / AuthzPolicy)
 
 See [CHANGELOG.md](CHANGELOG.md) for the full per-release list.
